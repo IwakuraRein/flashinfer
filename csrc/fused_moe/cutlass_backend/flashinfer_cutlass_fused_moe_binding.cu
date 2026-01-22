@@ -188,29 +188,53 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       if (mActivationDtype == dl_float16) {
 #ifdef ENABLE_FP8
         if (mUseW4GroupScaling) {
-          mKernelRunner = std::make_unique<
-              kernels::CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, half, half>>();
+          if (mWeightDtype == dl_uint8)
+            mKernelRunner = std::make_unique<
+                kernels::CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, half, half>>();
+          else
+            mKernelRunner = std::make_unique<
+                kernels::CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::int4b_t, half, half>>();
         } else {
-          mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<half, cutlass::uint4b_t>>();
+          if (mWeightDtype == dl_uint8)
+            mKernelRunner =
+                std::make_shared<kernels::CutlassMoeFCRunner<half, cutlass::uint4b_t>>();
+          else
+            mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<half, cutlass::int4b_t>>();
         }
 #else
-        mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<half, cutlass::uint4b_t>>();
+        if (mWeightDtype == dl_uint8)
+          mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<half, cutlass::uint4b_t>>();
+        else
+          mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<half, cutlass::int4b_t>>();
 #endif
       }
 #ifdef ENABLE_BF16
       else if (mActivationDtype == dl_bfloat16) {
 #ifdef ENABLE_FP8
         if (mUseW4GroupScaling) {
-          mKernelRunner =
-              std::make_unique<kernels::CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t,
-                                                           __nv_bfloat16, __nv_bfloat16>>();
+          if (mWeightDtype == dl_uint8)
+            mKernelRunner =
+                std::make_unique<kernels::CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t,
+                                                             __nv_bfloat16, __nv_bfloat16>>();
+          else
+            mKernelRunner =
+                std::make_unique<kernels::CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::int4b_t,
+                                                             __nv_bfloat16, __nv_bfloat16>>();
         } else {
-          mKernelRunner =
-              std::make_shared<kernels::CutlassMoeFCRunner<__nv_bfloat16, cutlass::uint4b_t>>();
+          if (mWeightDtype == dl_uint8)
+            mKernelRunner =
+                std::make_shared<kernels::CutlassMoeFCRunner<__nv_bfloat16, cutlass::uint4b_t>>();
+          else
+            mKernelRunner =
+                std::make_shared<kernels::CutlassMoeFCRunner<__nv_bfloat16, cutlass::int4b_t>>();
         }
 #else
-        mKernelRunner =
-            std::make_shared<kernels::CutlassMoeFCRunner<__nv_bfloat16, cutlass::uint4b_t>>();
+        if (mWeightDtype == dl_uint8)
+          mKernelRunner =
+              std::make_shared<kernels::CutlassMoeFCRunner<__nv_bfloat16, cutlass::uint4b_t>>();
+        else
+          mKernelRunner =
+              std::make_shared<kernels::CutlassMoeFCRunner<__nv_bfloat16, cutlass::int4b_t>>();
 #endif
       }
 #endif
@@ -1180,7 +1204,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     return mUseW4GroupScaling && mWeightDtype == dl_uint8 && !mUsePackedWeights;
   }
 
-  bool isInt4Quant() const { return mWeightDtype == dl_uint8 && mUsePackedWeights; }
+  bool isInt4Quant() const {
+    return (mWeightDtype == dl_uint8 || mWeightDtype == dl_int8) && mUsePackedWeights;
+  }
 
   bool isW4AFp8Quant() const { return mActivationDtype == dl_float8_e4m3fn && isInt4Quant(); }
 

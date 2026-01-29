@@ -1111,6 +1111,7 @@ def get_trtllm_moe_sm100_module():
                     kwargs["routing_method_type"],
                     kwargs["use_shuffled_weight"],
                     kwargs["weight_layout"],
+                    kwargs["do_finalize"],
                     kwargs["enable_pdl"],
                     [-1, -1] if tactic == -1 else tactic,
                 )
@@ -1289,9 +1290,10 @@ def get_trtllm_moe_sm100_module():
         routing_method_type: int,
         use_shuffled_weight: bool,
         weight_layout: int,
+        do_finalize: bool = True,
         enable_pdl: Optional[bool] = None,
         tune_max_num_tokens: int = 8192,
-    ) -> torch.Tensor:
+    ) -> List[torch.Tensor]:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
 
@@ -1348,11 +1350,12 @@ def get_trtllm_moe_sm100_module():
             routing_method_type=routing_method_type,
             use_shuffled_weight=use_shuffled_weight,
             weight_layout=weight_layout,
+            do_finalize=do_finalize,
             enable_pdl=enable_pdl,
         )
 
         # Call the C++ function with the selected tactic
-        result = moe_op.trtllm_bf16_moe(
+        intermediate_output = moe_op.trtllm_bf16_moe(
             routing_logits,
             routing_bias,
             hidden_states,
@@ -1369,10 +1372,20 @@ def get_trtllm_moe_sm100_module():
             routing_method_type,
             use_shuffled_weight,
             weight_layout,
+            do_finalize,
             enable_pdl,
             [-1, -1] if tactic == -1 else tactic,
         )
-        return result
+        
+        if do_finalize:
+            return [output]
+        else:
+            gemm2_output, _, expanded_idx_to_permuted_idx = intermediate_output
+            return [
+                torch.from_dlpack(gemm2_output),
+                expert_weights,
+                torch.from_dlpack(expanded_idx_to_permuted_idx),
+            ]
 
     @register_fake_op("flashinfer::trtllm_bf16_moe")
     def _fake_trtllm_bf16_moe(
@@ -1391,9 +1404,10 @@ def get_trtllm_moe_sm100_module():
         routing_method_type: int,
         use_shuffled_weight: bool,
         weight_layout: int,
+        do_finalize: bool = True,
         enable_pdl: Optional[bool] = None,
         tune_max_num_tokens: int = 8192,
-    ):
+    ) -> List[torch.Tensor]:
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
 
@@ -2099,9 +2113,10 @@ def trtllm_bf16_moe(
     routing_method_type: int = 0,
     use_shuffled_weight: bool = True,
     weight_layout: int = WeightLayout.BlockMajorK,
+    do_finalize: bool = True,
     enable_pdl: bool = True,
     tune_max_num_tokens: int = 8192,
-) -> torch.Tensor:
+) -> List[torch.Tensor]:
     """BF16 MoE operation with autotuning support.
 
     This function implements a bfloat16 Mixture of Experts layer using the TensorRT-LLM backend
@@ -2132,11 +2147,13 @@ def trtllm_bf16_moe(
             - 4: RenormalizeNaive (Softmax -> TopK -> Renormalize)
         use_shuffled_weight: Whether to use shuffled weight layout for optimization (default: True).
         weight_layout: Weight layout format. must be WeightLayout.BlockMajorK ([K/blockK, Mn, blockK])
+        do_finalize: Whether to finalize the output (default: True).
         enable_pdl: Whether to enable Programmatic Dependent Launch. Auto-enabled for >= sm90.
         tune_max_num_tokens: Maximum number of tokens for autotuning (default: 8192).
 
     Returns:
-        torch.Tensor: Output tensor of shape [seq_len, hidden_size].
+        List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
+            Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
     return get_trtllm_moe_sm100_module().trtllm_bf16_moe(
         routing_logits,
@@ -2155,6 +2172,7 @@ def trtllm_bf16_moe(
         routing_method_type,
         use_shuffled_weight,
         weight_layout,
+        do_finalize,
         enable_pdl,
         tune_max_num_tokens,
     )

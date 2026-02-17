@@ -1859,9 +1859,9 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
   auto& selected_launcher = launchers_map.at(tile_N);
 
   // Run the launcher with DeepSeek FP8 enabled - it will create its own runner internally
-  return result = selected_launcher->run(
-             config, enable_pdl, false /* use_routing_scales_on_input */,
-             quantization_type == Fp8QuantizationType::DeepSeekFp8 /* use_deep_seek_fp8 */);
+  return selected_launcher->run(
+      config, enable_pdl, false /* use_routing_scales_on_input */,
+      quantization_type == Fp8QuantizationType::DeepSeekFp8 /* use_deep_seek_fp8 */);
 }
 
 Array<Tensor> trtllm_fp4_block_scale_moe(

@@ -1420,7 +1420,7 @@ def get_trtllm_moe_sm100_module():
         else:
             return [
                 torch.from_dlpack(intermediate_output[0]),
-                expert_weights,
+                torch.from_dlpack(intermediate_output[1]),
                 torch.from_dlpack(intermediate_output[2]),
             ]
 
@@ -1570,7 +1570,7 @@ def get_trtllm_moe_sm100_module():
         else:
             return [
                 torch.from_dlpack(intermediate_output[0]),
-                expert_weights,
+                torch.from_dlpack(intermediate_output[1]),
                 torch.from_dlpack(intermediate_output[2]),
             ]
 
@@ -1765,7 +1765,11 @@ def get_trtllm_moe_sm100_module():
         else:
             return [
                 torch.from_dlpack(intermediate_output[0]),
-                expert_weights,
+                (
+                    torch.from_dlpack(intermediate_output[1])
+                    if routing_logits is not None or expert_weights.numel() == 0
+                    else expert_weights
+                ),
                 torch.from_dlpack(intermediate_output[2]),
             ]
 
@@ -2162,7 +2166,7 @@ def get_trtllm_moe_sm100_module():
         else:
             return [
                 torch.from_dlpack(intermediate_output[0]),
-                expert_weights,
+                torch.from_dlpack(intermediate_output[1]),
                 torch.from_dlpack(intermediate_output[2]),
             ]
 

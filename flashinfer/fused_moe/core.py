@@ -2539,7 +2539,7 @@ def trtllm_fp8_block_scale_routed_moe(
         fp8_quantization_type: Type of FP8 quantization to use (default: DeepSeekFp8)
     Returns:
         List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
-            Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
+            Otherwise, returns intermediate results (gemm2_output, undefined, expanded_idx_to_permuted_idx) that need further processing.
     """
     return get_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
         None,  # routing_logits
@@ -2799,7 +2799,7 @@ def trtllm_fp4_block_scale_routed_moe(
 
     Returns:
         List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
-            Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
+            Otherwise, returns intermediate results (gemm2_output, undefined, expanded_idx_to_permuted_idx) that need further processing.
     """
     return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
         None,

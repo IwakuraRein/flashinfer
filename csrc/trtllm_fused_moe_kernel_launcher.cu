@@ -401,7 +401,7 @@ class FusedMoeLauncher {
     if (args->do_finalize) {
       return {output};
     }
-    return {gemm2_output, expanded_idx_to_permuted_idx};
+    return {gemm2_output, FusedMoeLauncher::expert_weights, expanded_idx_to_permuted_idx};
   }
 };
 
@@ -1078,7 +1078,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     if (args->do_finalize) {
       return {output};
     }
-    return {gemm2_output, expanded_idx_to_permuted_idx};
+    return {gemm2_output, FusedMoeLauncher::expert_weights, expanded_idx_to_permuted_idx};
   }
 
   static Array<Array<int64_t>> getValidConfigs(int64_t top_k, int64_t hidden_size,
@@ -1542,7 +1542,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     if (args->do_finalize) {
       return {output};
     }
-    return {gemm2_output, expanded_idx_to_permuted_idx};
+    return {gemm2_output, FusedMoeLauncher::expert_weights, expanded_idx_to_permuted_idx};
   }
 
   static Array<Array<int64_t>> getValidConfigs(int64_t top_k, int64_t hidden_size,

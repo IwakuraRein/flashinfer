@@ -2230,7 +2230,7 @@ def trtllm_bf16_moe(
     do_finalize: bool = True,
     enable_pdl: bool = True,
     tune_max_num_tokens: int = 8192,
-) -> List[torch.Tensor]:
+) -> Union[List[torch.Tensor], torch.Tensor]:
     """BF16 MoE operation with autotuning support.
 
     This function implements a bfloat16 Mixture of Experts layer using the TensorRT-LLM backend
@@ -2269,10 +2269,10 @@ def trtllm_bf16_moe(
         tune_max_num_tokens: Maximum number of tokens for autotuning (default: 8192).
 
     Returns:
-        List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
-            Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
+        when do_finalize=True, returns the final MoE output.
+        otherwise, returns the intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
-    return get_trtllm_moe_sm100_module().trtllm_bf16_moe(
+    result = get_trtllm_moe_sm100_module().trtllm_bf16_moe(
         routing_logits,
         routing_bias,
         hidden_states,
@@ -2293,6 +2293,14 @@ def trtllm_bf16_moe(
         enable_pdl,
         tune_max_num_tokens,
     )
+
+    if do_finalize:
+        logger.warning_once(
+            "the single torch.Tensor return type is deprecated and will be replaced with List[torch.Tensor] in the v0.8.0."
+        )
+        return result[0]
+    else:
+        return result
 
 
 @flashinfer_api

@@ -11,6 +11,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <cooperative_groups.h>
 #include <cuda_runtime.h>
 #include <flashinfer/exception.h>
 #include <nvrtc.h>
@@ -18,6 +19,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cub/cub.cuh>
 #include <iomanip>
 #include <iostream>
 #include <set>
@@ -2182,6 +2184,252 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
   return Array<Array<int64_t>>();
 }
 
+using tensorrt_llm::kernels::ActType;
+using tensorrt_llm::kernels::EltwiseActType;
+using tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner;
+using tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions;
+
+void TllmNvfp4BatchedGemm(
+    // metadata
+    int64_t const numTokens, int64_t const numExperts, int64_t const topK, int64_t const tileSize,
+    int64_t const tactic, bool const fuseActivation, bool const enablePDL,
+    // normal input buffers
+    TensorView const& hiddenStates, TensorView const& hiddenStatesScale, TensorView const& weights,
+    TensorView const& weightsScale, Optional<TensorView> bias,
+    // swiglu params. size [numExperts]
+    Optional<TensorView> swigluAlpha, Optional<TensorView> swigluBeta,
+    Optional<TensorView> swigluClampLimit,
+    // trtllm-gen routing stuffs
+    int64_t const maxNumCtasInBatchDim, TensorView const& totalNumPaddedTokens,
+    TensorView const& numNonExistingCtas, TensorView const& ctaIdxXyToBatchIdx,
+    TensorView const& ctaIdxXyToMnLimit, Optional<TensorView> routeMap,
+    // scales for Llamma4
+    Optional<TensorView> tokenScales,
+    // scales for output. size [numExperts]
+    Optional<TensorView> outputScales,
+    // scales for gated output when using swiglu. size [numExperts]
+    Optional<TensorView> outputScalesGate,
+    // output
+    TensorView output) {
+  TVM_FFI_ICHECK_EQ(output.ndim(), 2) << "output buffer dimension must be 2.";
+  TVM_FFI_ICHECK_EQ(hiddenStates.ndim(), 2) << "hiddenStates dimension must be 2.";
+  TVM_FFI_ICHECK_EQ(weights.ndim(), 2) << "weights dimension must be 2.";
+  TVM_FFI_ICHECK_EQ(output.dtype(), dl_bfloat16) << "output buffer must be bfloat16.";
+  TVM_FFI_ICHECK_EQ(hiddenStates.dtype(), dl_uint8)
+      << "hiddenStates must be uint8 (representing packed nvfp4).";
+  TVM_FFI_ICHECK_EQ(weights.dtype(), dl_uint8)
+      << "weights must be uint8 (representing packed nvfp4).";
+  TVM_FFI_ICHECK_EQ(totalNumPaddedTokens.numel(), 1)
+      << "totalNumPaddedTokens must have exactly 1 element.";
+  TVM_FFI_ICHECK_EQ(numNonExistingCtas.numel(), 1)
+      << "numNonExistingCtas must have exactly 1 element.";
+  TVM_FFI_ICHECK_EQ(hiddenStates.size(1), weights.size(1))
+      << "hiddenStates and weights shapes not match.";
+
+  auto const device = hiddenStates.device();
+  auto const stream = get_stream(device);
+  int32_t const M = hiddenStates.size(0);
+  int32_t const N = weights.size(0);
+  int32_t const K = hiddenStates.size(1) * 2;
+  TVM_FFI_ICHECK_EQ(output.size(0), M) << "output buffer size not match M.";
+  TVM_FFI_ICHECK_EQ(output.size(1), N) << "output buffer size not match N.";
+
+  // int32_t const maxCtasInBatchDimPerExpert = ceil_div(numTokens, tileSize);
+  // int32_t const maxEnabledExperts = std::min(numTokens * topK, numExperts);
+  // int32_t const maxNumCtasInBatchDim = maxCtasInBatchDimPerExpert * maxEnabledExperts;
+
+  TrtllmGenBatchedGemmRunnerOptions options{
+      .dtypeA = btg::Dtype::E2m1,
+      .dtypeB = btg::Dtype::E2m1,
+      .dtypeC = btg::Dtype::Bfloat16,
+      .actType = ActType::SwiGlu,
+      .eltwiseActType = EltwiseActType::None,
+      .deepSeekFp8 = false,
+      .fusedAct = fuseActivation,
+      .routeAct = routeMap.has_value(),
+      .staticBatch = false,
+      .transposeMmaOutput = true,
+      .tileSize = static_cast<int32_t>(tileSize),
+      .epilogueTileM = 128,
+      .useShuffledMatrix = true,
+      .weightLayout = batchedGemm::gemm::MatrixLayout::MajorK};
+
+  TrtllmGenBatchedGemmRunner runner{options};
+  int32_t const configIdx = tactic >= 0
+                                ? tactic
+                                : runner.getDefaultValidConfigIndex(
+                                      M, N, K, {}, numTokens, numExperts, maxNumCtasInBatchDim);
+  int32_t const workspaceSize = runner.getWorkspaceSizeInBytes(M, N, K, {}, numTokens, numExperts,
+                                                               maxNumCtasInBatchDim, configIdx);
+  auto workspace = alloc_tensor({workspaceSize}, dl_int8, device);
+  runner.run(
+      M, N, K, {},  // batchedTokens. not used since we are using dynamic batch
+      static_cast<int32_t>(numTokens), static_cast<int32_t>(numExperts),
+      static_cast<int32_t>(maxNumCtasInBatchDim), hiddenStates.data_ptr(),
+      hiddenStatesScale.data_ptr(), weights.data_ptr(), weightsScale.data_ptr(),
+      tokenScales.has_value() ? tokenScales.value().data_ptr() : nullptr,  // perTokensSfA
+      nullptr,                                                             // perTokenSfB
+      outputScales.has_value() ? static_cast<float const*>(outputScales.value().data_ptr())
+                               : nullptr,  // scaleC
+      outputScalesGate.has_value() ? static_cast<float const*>(outputScalesGate.value().data_ptr())
+                                   : nullptr,  // scaleGateC
+      bias.has_value() ? static_cast<float const*>(bias.value().data_ptr()) : nullptr,
+      swigluAlpha.has_value() ? static_cast<float const*>(swigluAlpha.value().data_ptr()) : nullptr,
+      swigluBeta.has_value() ? static_cast<float const*>(swigluBeta.value().data_ptr()) : nullptr,
+      swigluClampLimit.has_value() ? static_cast<float const*>(swigluClampLimit.value().data_ptr())
+                                   : nullptr,
+      output.data_ptr(),  // c
+      nullptr,            // outSfC
+      routeMap.has_value() ? static_cast<int32_t const*>(routeMap.value().data_ptr()) : nullptr,
+      static_cast<int32_t const*>(totalNumPaddedTokens.data_ptr()),
+      static_cast<int32_t const*>(ctaIdxXyToBatchIdx.data_ptr()),
+      static_cast<int32_t const*>(ctaIdxXyToMnLimit.data_ptr()),
+      static_cast<int32_t const*>(numNonExistingCtas.data_ptr()), workspace.data_ptr(), stream,
+      device.device_id, configIdx, enablePDL);
+}
+
+__device__ __forceinline__ float atomicMax(float *address, float val)
+{
+    int ret = __float_as_int(*address);
+    while(val > __int_as_float(ret))
+    {
+        int old = ret;
+        if((ret = atomicCAS((int *)address, old, __float_as_int(val))) == old)
+            break;
+    }
+    return __int_as_float(ret);
+}
+
+template <typename T, uint32_t topK, uint32_t block_size, bool packedTopkIds = true>
+__global__ void tllmPermuteAndPerExpertQuanizeKernel(int const numTokens, int const hiddenSize,
+                                                     int const tileSize, T* hiddenStates,
+                                                     T* permutedHiddenStates, int* topkIds,
+                                                     int* expandedTokenIdxToPermutedIdx,
+                                                     float* perExpertAmax) {
+  int tokenId = blockIdx.x;
+  int col = threadIdx.x;
+  float localAmex[topK];
+  memset(&localAmex[0], 0, topK * 4);
+  for (int i = col; i < hiddenSize; i += block_size) {
+    T element = hiddenStates[tokenId * hiddenSize + i];
+    float element_float_abs = fabsf(static_cast<float>(element));
+#pragma unroll
+    for (int j = 0; j < topK; ++j) {
+      localAmex[j] = fmaxf(localAmex[j], element_float_abs);
+      int const permutedRow = expandedTokenIdxToPermutedIdx[tokenId * topK + j];
+      if (permutedRow < 0) continue;
+      permutedHiddenStates[permutedRow * hiddenSize + i] = element;
+    }
+  }
+  if (perExpertAmax == nullptr) return;
+  // find the amax of topk rows of this token
+  using BlockReduce = cub::BlockReduce<float, block_size>;
+  __shared__ typename BlockReduce::TempStorage temp_storage;
+#pragma unroll
+  for (int i = 0; i < topK; ++i) {
+    float blockMax = BlockReduce(temp_storage).Reduce(localAmex[i], ::cuda::maximum());
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      int expertIdx = topkIds[tokenId * topK + i];
+      if constexpr (packedTopkIds) expertIdx = expertIdx >> 16;
+      atomicMax(&perExpertAmax[expertIdx], blockMax);
+    }
+  }
+}
+
+#define DISPATCH_TLLM_PERMUTE_KERNEL(DTYPE, TOP_K, BLOCK_SIZE)                                  \
+  tllmPermuteAndPerExpertQuanizeKernel<DTYPE, TOP_K, BLOCK_SIZE>                                \
+      <<<gridSize, blockSize, globalExpertNum * 4>>>(                                           \
+          numTokens, hiddenSize, tileSize, static_cast<DTYPE*>(hiddenStates.data_ptr()),        \
+          static_cast<DTYPE*>(permutedHiddenStates.data_ptr()),                                 \
+          static_cast<int32_t*>(topkIdsPacked.data_ptr()),                                      \
+          static_cast<int32_t*>(expandedTokenIdxToPermutedIdx.data_ptr()),                      \
+          perExpertAmax.has_value() ? static_cast<float*>(perExpertAmax.value().data_ptr()) \
+                                      : nullptr);
+
+// return: totalNumPaddedTokens,expandedTokenIdxToPermutedIdx, ctaIdxXyToBatchIdx,
+//         ctaIdxXyToMnLimit, numNonExitingCtas, permutedHiddenStates
+Array<Tensor> TllmPermute(
+    // metadata
+    int64_t const tileSize,
+    // routing stuffs
+    int64_t const topK, int64_t const globalExpertNum, int64_t const localExpertNum,
+    int64_t const localExpertOffset,
+    // input tensors
+    TensorView const& topkIdsPacked, TensorView const& hiddenStates,
+    // per-expert quantization scale. size [globalExpertNum]
+    Optional<TensorView> perExpertAmax) {
+  TVM_FFI_ICHECK_EQ(hiddenStates.dtype(), dl_bfloat16) << "hiddenStates must be bfloat16.";
+  auto device = hiddenStates.device();
+  auto stream = get_stream(device);
+
+  int32_t const numTokens = hiddenStates.size(0);
+  int32_t const hiddenSize = hiddenStates.size(1);
+  int32_t const maxNumPaddedTokens =
+      tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxPermutedPaddedCount(
+          numTokens, topK, globalExpertNum, tileSize);
+  int32_t const maxNumCtas = tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxNumCtasInBatchDim(
+      numTokens, topK, globalExpertNum, tileSize);
+  // 256 is the max number of threads per block and max number of experts
+  Tensor expertCountHistogram = alloc_tensor(
+      {std::max(static_cast<int32_t>(globalExpertNum) * 2, 256 * 2)}, dl_int32, device);
+  Tensor totalNumPaddedTokens = alloc_tensor({1}, dl_int32, device);
+  Tensor expandedTokenIdxToPermutedIdx = alloc_tensor({numTokens * topK}, dl_int32, device);
+  Tensor permutedIdxToTokenIdx = alloc_tensor({maxNumPaddedTokens}, dl_int32, device);
+  Tensor numTokensPerExpert = alloc_tensor({globalExpertNum}, dl_int32, device);
+  Tensor ctaIdxXyToBatchIdx = alloc_tensor({maxNumCtas}, dl_int32, device);
+  Tensor ctaIdxXyToMnLimit = alloc_tensor({maxNumCtas}, dl_int32, device);
+  Tensor numNonExitingCtas = alloc_tensor({1}, dl_int32, device);
+  Tensor permutedHiddenStates =
+      alloc_tensor({maxNumPaddedTokens, hiddenSize}, hiddenStates.dtype(), device);
+
+  tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner runner{static_cast<int32_t>(tileSize)};
+
+  // get the permute data. the routing data are irrelevant since topIds is provided
+  runner.run(nullptr,                                 // routing logits
+             nullptr,                                 // routing bias
+             numTokens, globalExpertNum, topK, 1, 1,  // nGroup, topKGroup
+             localExpertOffset, localExpertNum,
+             1.f,  // routedScalingFactor
+             static_cast<int32_t*>(topkIdsPacked.data_ptr()),
+             static_cast<int32_t*>(expertCountHistogram.data_ptr()),
+             static_cast<int32_t*>(totalNumPaddedTokens.data_ptr()),
+             static_cast<int32_t*>(expandedTokenIdxToPermutedIdx.data_ptr()),
+             nullptr,  // permutedIdxToExpandedIdx
+             static_cast<int32_t*>(permutedIdxToTokenIdx.data_ptr()),
+             nullptr,  // expert weight
+             static_cast<int32_t*>(numTokensPerExpert.data_ptr()),
+             static_cast<int32_t*>(ctaIdxXyToBatchIdx.data_ptr()),
+             static_cast<int32_t*>(ctaIdxXyToMnLimit.data_ptr()),
+             static_cast<int32_t*>(numNonExitingCtas.data_ptr()), btg::Dtype::Bfloat16,
+             btg::Dtype::Bfloat16, false, false, RoutingMethodType::Renormalize, stream);
+
+  if (perExpertAmax.has_value()) {
+    TVM_FFI_ICHECK_EQ(perExpertAmax.value().dtype(), dl_float32)
+        << "per-expert quantization scales must be float32.";
+  }
+  uint32_t constexpr blockSize = 256;
+  uint32_t const gridSize = numTokens;
+
+  switch (topK) {
+    case 4:
+      DISPATCH_TLLM_PERMUTE_KERNEL(__nv_bfloat16, 4, blockSize);
+      break;
+    case 8:
+      DISPATCH_TLLM_PERMUTE_KERNEL(__nv_bfloat16, 8, blockSize);
+      break;
+    case 16:
+      DISPATCH_TLLM_PERMUTE_KERNEL(__nv_bfloat16, 16, blockSize);
+      break;
+    default:
+      TVM_FFI_LOG_AND_THROW(NotImplementedError)
+          << "Unsupported topk for trtllm-gen permute kernel.";
+  }
+  return {totalNumPaddedTokens, expandedTokenIdxToPermutedIdx,
+          ctaIdxXyToBatchIdx,   ctaIdxXyToMnLimit,
+          numNonExitingCtas,    permutedHiddenStates};
+}
+
 namespace trtllm_cubin_loader {
 #include <flashinfer/cubin_loader.h>
 }
@@ -2192,5 +2440,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fp8_block_scale_moe, trtllm_fp8_block_scale
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fp4_block_scale_moe, trtllm_fp4_block_scale_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_mxint4_block_scale_moe, trtllm_mxint4_block_scale_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_get_valid_moe_configs, trtllm_get_valid_moe_configs);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_nvfp4_batched_gemm, TllmNvfp4BatchedGemm);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_permute, TllmPermute);
 
 }  // namespace flashinfer

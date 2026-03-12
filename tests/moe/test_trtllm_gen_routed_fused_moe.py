@@ -528,3 +528,87 @@ def test_trtllm_gen_bf16_routed_fused_moe(
     # mismatch percentage
     mismatch_pct = (~mask).float().mean().item() * 100
     assert mismatch_pct < 10, f"Mismatch percentage is {mismatch_pct:.2f}%"
+
+from flashinfer.jit.fused_moe import gen_trtllm_gen_fused_moe_sm100_module
+from flashinfer.jit import setup_cubin_loader
+
+@pytest.mark.parametrize("tile_size", [8])
+@pytest.mark.parametrize("hidden_size", [128])
+@pytest.mark.parametrize("num_tokens", [16])
+@pytest.mark.parametrize("top_k", [4])
+@pytest.mark.parametrize(
+    "global_expert_num,local_expert_num,local_expert_offset",
+    [
+        (32,32,0),
+        # (128,32,32),
+    ],
+)
+def test_trtllm_permute(
+    tile_size: int,
+    num_tokens: int,
+    hidden_size: int,
+    top_k: int,
+    global_expert_num: int,
+    local_expert_num: int,
+    local_expert_offset: int,
+):
+    torch.random.manual_seed(42)
+    assert local_expert_offset + local_expert_num <= global_expert_num, "Invalid expert configuration"
+    module = gen_trtllm_gen_fused_moe_sm100_module()
+    moe_op = module.build_and_load()
+    setup_cubin_loader(str(module.get_library_path()))
+    # topk_ids = torch.randint(0, global_expert_num, (num_tokens, top_k), device='cuda', dtype=torch.int32)
+    routing_logits = torch.rand(num_tokens, global_expert_num, device='cuda').to(
+        torch.bfloat16
+    )
+    permute_info, expert_weights_ = routing_reference_renormalize(
+        routing_logits, top_k, global_expert_num, tile_size
+    )
+    topk_ids = permute_info["topKIndices"].to(torch.int32)
+    expert_weights = expert_weights_.view(num_tokens, global_expert_num)[
+        torch.arange(num_tokens, device='cuda').unsqueeze(1), topk_ids
+    ].to(torch.bfloat16)
+    expandedTokenIdxToPermutedIdxRef = permute_info["expandedTokenIdxToPermutedIdx"].to(torch.int32)
+    print(f'{topk_ids=}')
+    print(f'{expandedTokenIdxToPermutedIdxRef.view(num_tokens, top_k)=}')
+    hidden_states = torch.randn((num_tokens, hidden_size), device='cuda', dtype=torch.bfloat16)
+
+    expert_weights_int16 = expert_weights.to(torch.bfloat16).view(torch.int16)
+    packed_tensor = (topk_ids << 16) | (expert_weights_int16.to(torch.int32))
+
+    perExpertAmax = torch.zeros((global_expert_num, ), device='cuda', dtype=torch.float)
+    (
+        totalNumPaddedTokens,
+        expandedTokenIdxToPermutedIdx,
+        ctaIdxXyToBatchIdx,
+        ctaIdxXyToMnLimit,
+        numNonExitingCtas,
+        permutedHiddenStates,
+    ) = moe_op.trtllm_permute(
+        8,  # tileSize
+        top_k,
+        global_expert_num,
+        local_expert_num,
+        local_expert_offset,
+        packed_tensor,
+        hidden_states,
+        perExpertAmax,
+    )
+    totalNumPaddedTokens = torch.from_dlpack(totalNumPaddedTokens)
+    expandedTokenIdxToPermutedIdx = torch.from_dlpack(expandedTokenIdxToPermutedIdx)
+    ctaIdxXyToBatchIdx = torch.from_dlpack(ctaIdxXyToBatchIdx)
+    ctaIdxXyToMnLimit = torch.from_dlpack(ctaIdxXyToMnLimit)
+    numNonExitingCtas = torch.from_dlpack(numNonExitingCtas)
+    permutedHiddenStates = torch.from_dlpack(permutedHiddenStates)
+
+    print(f'{totalNumPaddedTokens=}')
+    print(f'{expandedTokenIdxToPermutedIdx.view(num_tokens, top_k)=}')
+    print(f'{ctaIdxXyToBatchIdx=}')
+    print(f'{ctaIdxXyToMnLimit=}')
+    print(f'{numNonExitingCtas=}')
+    print(f'{permutedHiddenStates.shape=}')
+    indices = expandedTokenIdxToPermutedIdx.view(num_tokens, top_k)[:, 0]
+    print(f'{hidden_states[:10, :10]=}')
+    print(f'{permutedHiddenStates[indices[:10], :10]=}')
+    torch.testing.assert_close(hidden_states, permutedHiddenStates[indices, :], atol=1e-2, rtol=1e-2)
+    print(f'{perExpertAmax=}')

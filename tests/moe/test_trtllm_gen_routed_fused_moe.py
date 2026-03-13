@@ -532,10 +532,10 @@ def test_trtllm_gen_bf16_routed_fused_moe(
 from flashinfer.jit.fused_moe import gen_trtllm_gen_fused_moe_sm100_module
 from flashinfer.jit import setup_cubin_loader
 
-@pytest.mark.parametrize("tile_size", [8])
-@pytest.mark.parametrize("hidden_size", [128])
-@pytest.mark.parametrize("num_tokens", [16])
-@pytest.mark.parametrize("top_k", [4])
+@pytest.mark.parametrize("tile_size", [128])
+@pytest.mark.parametrize("hidden_size", [3072])
+@pytest.mark.parametrize("num_tokens", [128])
+@pytest.mark.parametrize("top_k", [4, 8])
 @pytest.mark.parametrize(
     "global_expert_num,local_expert_num,local_expert_offset",
     [
@@ -585,7 +585,7 @@ def test_trtllm_permute(
         numNonExitingCtas,
         permutedHiddenStates,
     ) = moe_op.trtllm_permute(
-        8,  # tileSize
+        tile_size,
         top_k,
         global_expert_num,
         local_expert_num,
@@ -612,3 +612,193 @@ def test_trtllm_permute(
     print(f'{permutedHiddenStates[indices[:10], :10]=}')
     torch.testing.assert_close(hidden_states, permutedHiddenStates[indices, :], atol=1e-2, rtol=1e-2)
     print(f'{perExpertAmax=}')
+
+
+@pytest.mark.parametrize("tile_size", [128])
+@pytest.mark.parametrize("hidden_size", [3072])
+@pytest.mark.parametrize("intermediate_size", [2048])
+@pytest.mark.parametrize("num_tokens", [16])
+@pytest.mark.parametrize("top_k", [8])
+@pytest.mark.parametrize("expert_num", [32])
+def test_trtllm_nvfp4_batched_gemm(
+    tile_size: int,
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+    expert_num: int,
+):
+    device = torch.device('cuda:0')
+    torch.random.manual_seed(42)
+    module = gen_trtllm_gen_fused_moe_sm100_module()
+    moe_op = module.build_and_load()
+    setup_cubin_loader(str(module.get_library_path()))
+    routing_logits = torch.rand(num_tokens, expert_num, device='cuda').to(
+        torch.bfloat16
+    )
+    permute_info, expert_weights_ = routing_reference_renormalize(
+        routing_logits, top_k, expert_num, tile_size
+    )
+    topk_ids = permute_info["topKIndices"].to(torch.int32)
+    expert_weights = expert_weights_.view(num_tokens, expert_num)[
+        torch.arange(num_tokens, device='cuda').unsqueeze(1), topk_ids
+    ].to(torch.bfloat16)
+    packed_tensor = (topk_ids << 16) | (expert_weights.view(torch.int16).to(torch.int32))
+
+    hidden_states = torch.randn((num_tokens, hidden_size), device=device, dtype=torch.bfloat16)
+    w13 = torch.randn((expert_num, intermediate_size * 2, hidden_size), device=device, dtype=torch.bfloat16)
+    w2 = torch.randn((expert_num, hidden_size, intermediate_size), device=device, dtype=torch.bfloat16)
+
+    # generate routing data and permute the hidden states
+    (
+        totalNumPaddedTokens,
+        expandedTokenIdxToPermutedIdx,
+        ctaIdxXyToBatchIdx,
+        ctaIdxXyToMnLimit,
+        numNonExitingCtas,
+        permutedHiddenStates,
+    ) = moe_op.trtllm_permute(
+        tile_size,
+        top_k,
+        expert_num,
+        expert_num,
+        0,
+        packed_tensor,
+        hidden_states,
+        None,  # perExpertAmax
+    )
+    totalNumPaddedTokens = torch.from_dlpack(totalNumPaddedTokens)
+    expandedTokenIdxToPermutedIdx = torch.from_dlpack(expandedTokenIdxToPermutedIdx)
+    ctaIdxXyToBatchIdx = torch.from_dlpack(ctaIdxXyToBatchIdx)
+    ctaIdxXyToMnLimit = torch.from_dlpack(ctaIdxXyToMnLimit)
+    numNonExitingCtas = torch.from_dlpack(numNonExitingCtas)
+    permutedHiddenStates = torch.from_dlpack(permutedHiddenStates)
+    histogram = torch.histc(topk_ids.float().flatten(), bins=expert_num, min=0, max=expert_num-1).int()
+    print(f'{topk_ids=}')
+    print(f'{histogram=}')
+    print(f'{totalNumPaddedTokens=}')
+    print(f'{expandedTokenIdxToPermutedIdx.view(num_tokens, top_k)=}')
+    print(f'{ctaIdxXyToBatchIdx=}')
+    print(f'{ctaIdxXyToMnLimit=}')
+    print(f'{numNonExitingCtas=}')
+    print(f'{permutedHiddenStates.shape=}')
+    indices = expandedTokenIdxToPermutedIdx.view(num_tokens, top_k)[:, 0]
+    print(f'{hidden_states[:10, :10]=}')
+    print(f'{permutedHiddenStates[indices[:10], :10]=}')
+
+    num_tokens_padded = permutedHiddenStates.shape[0]
+    max_num_ctas = ctaIdxXyToBatchIdx.shape[0]
+
+    print(f'{num_tokens_padded=}')
+    print(f'{max_num_ctas=}')
+
+    # quantize the weight and permuted hidden states
+    # TODO: use perExpertAmax to quantize
+    hidden_states_global_scale = (448 * 6) / hidden_states.float().abs().nan_to_num().max()
+    w13_global_scale = (448 * 6) / w13.float().abs().nan_to_num().max()
+    hidden_states_fp4, hidden_states_scales = fp4_quantize(
+        permutedHiddenStates,
+        hidden_states_global_scale,
+        is_sf_swizzled_layout=True,
+    )
+
+    w13_fp4_shuffled = []
+    w13_scales_shuffled = []
+    for i in range(expert_num):
+        w13_fp4, w13_scales = fp4_quantize(
+            w13[i],
+            w13_global_scale,
+            is_sf_swizzled_layout=False, # shuffle_matrix_sf_a will swizzle it to 128x4
+        )
+        w13_fp4 = shuffle_matrix_a(w13_fp4, 128).reshape(intermediate_size*2, hidden_size // 2)
+        w13_scales = shuffle_matrix_sf_a(w13_scales, 128).reshape(intermediate_size*2, hidden_size // 16)
+        w13_fp4_shuffled.append(w13_fp4)
+        w13_scales_shuffled.append(w13_scales)
+    w13_fp4 = torch.stack(w13_fp4_shuffled)
+    w13_scales = torch.stack(w13_scales_shuffled)
+    fc1_output = torch.empty((num_tokens_padded, intermediate_size * 2), device=device, dtype=torch.bfloat16)
+    
+    fc1_output_scales = torch.ones((expert_num, ), device=device, dtype=torch.float32) * hidden_states_global_scale * w13_global_scale
+
+
+    moe_op.trtllm_nvfp4_batched_gemm(
+        num_tokens,
+        expert_num,
+        top_k,
+        tile_size,
+        -1, # tactic
+        False, # fuseActivation
+        True, # enablePDL
+        hidden_states_fp4,
+        hidden_states_scales,
+        w13_fp4,
+        w13_scales,
+        None, # bias
+        None, # swiglu alpha
+        None, # swiglu beta
+        None, # swiglu clamp limit
+        max_num_ctas,
+        totalNumPaddedTokens,
+        numNonExitingCtas,
+        ctaIdxXyToBatchIdx,
+        ctaIdxXyToMnLimit,
+        None, # routeMap
+        None, # tokenScales
+        fc1_output_scales, # outputScales
+        None, # outputScalesGate
+        fc1_output
+    )
+
+    fc1_act = torch.nn.functional.silu(fc1_output[:, :intermediate_size]) * fc1_output[:, intermediate_size:]
+    print(f'{fc1_act.shape=}')
+    # quantize the w2 and fc1_act
+    fc1_act_global_scale = (448 * 6) / fc1_act.float().abs().nan_to_num().max()
+    w2_global_scale = (448 * 6) / w2.float().abs().nan_to_num().max()
+    fc1_act_fp4, fc1_act_scales = fp4_quantize(
+        fc1_act,
+        fc1_act_global_scale.to(device),
+        is_sf_swizzled_layout=True,
+    )
+    w2_fp4_shuffled = []
+    w2_scales_shuffled = []
+    for i in range(expert_num):
+        w2_fp4_i, w2_scales_i = fp4_quantize(
+            w2[i],
+            w2_global_scale.to(device),
+            is_sf_swizzled_layout=False, # shuffle_matrix_sf_a will swizzle it to 128x4
+        )
+        w2_fp4_i = shuffle_matrix_a(w2_fp4_i, 128).reshape(hidden_size, intermediate_size // 2)
+        w2_scales_i = shuffle_matrix_sf_a(w2_scales_i, 128).reshape(hidden_size, intermediate_size // 16)
+        w2_fp4_shuffled.append(w2_fp4_i)
+        w2_scales_shuffled.append(w2_scales_i)
+    w2_fp4 = torch.stack(w2_fp4_shuffled)
+    w2_scales = torch.stack(w2_scales_shuffled)
+    fc2_output = torch.empty((num_tokens_padded, hidden_size), device=device, dtype=torch.bfloat16)
+    fc2_output_scales = torch.ones((expert_num, ), device=device, dtype=torch.float32) * fc1_act_global_scale * w2_global_scale
+    moe_op.trtllm_nvfp4_batched_gemm(
+        num_tokens,
+        expert_num,
+        top_k,
+        tile_size,
+        -1, # tactic
+        False, # fuseActivation
+        True, # enablePDL
+        fc1_act_fp4,
+        fc1_act_scales,
+        w2_fp4,
+        w2_scales,
+        None, # bias
+        None, # swiglu alpha
+        None, # swiglu beta
+        None, # swiglu clamp limit
+        max_num_ctas,
+        totalNumPaddedTokens,
+        numNonExitingCtas,
+        ctaIdxXyToBatchIdx,
+        ctaIdxXyToMnLimit,
+        None, # routeMap
+        None, # tokenScales
+        fc2_output_scales, # outputScales
+        None, # outputScalesGate
+        fc2_output
+    )

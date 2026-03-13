@@ -2201,7 +2201,7 @@ void TllmNvfp4BatchedGemm(
     Optional<TensorView> swigluClampLimit,
     // trtllm-gen routing stuffs
     int64_t const maxNumCtasInBatchDim, TensorView const& totalNumPaddedTokens,
-    TensorView const& numNonExistingCtas, TensorView const& ctaIdxXyToBatchIdx,
+    TensorView const& numNonExitingCtas, TensorView const& ctaIdxXyToBatchIdx,
     TensorView const& ctaIdxXyToMnLimit, Optional<TensorView> routeMap,
     // scales for Llamma4
     Optional<TensorView> tokenScales,
@@ -2213,7 +2213,7 @@ void TllmNvfp4BatchedGemm(
     TensorView output) {
   TVM_FFI_ICHECK_EQ(output.ndim(), 2) << "output buffer dimension must be 2.";
   TVM_FFI_ICHECK_EQ(hiddenStates.ndim(), 2) << "hiddenStates dimension must be 2.";
-  TVM_FFI_ICHECK_EQ(weights.ndim(), 2) << "weights dimension must be 2.";
+  TVM_FFI_ICHECK_EQ(weights.ndim(), 3) << "weights dimension must be 3.";
   TVM_FFI_ICHECK_EQ(output.dtype(), dl_bfloat16) << "output buffer must be bfloat16.";
   TVM_FFI_ICHECK_EQ(hiddenStates.dtype(), dl_uint8)
       << "hiddenStates must be uint8 (representing packed nvfp4).";
@@ -2221,15 +2221,17 @@ void TllmNvfp4BatchedGemm(
       << "weights must be uint8 (representing packed nvfp4).";
   TVM_FFI_ICHECK_EQ(totalNumPaddedTokens.numel(), 1)
       << "totalNumPaddedTokens must have exactly 1 element.";
-  TVM_FFI_ICHECK_EQ(numNonExistingCtas.numel(), 1)
-      << "numNonExistingCtas must have exactly 1 element.";
-  TVM_FFI_ICHECK_EQ(hiddenStates.size(1), weights.size(1))
+  TVM_FFI_ICHECK_EQ(numNonExitingCtas.numel(), 1)
+      << "numNonExitingCtas must have exactly 1 element.";
+  TVM_FFI_ICHECK_EQ(hiddenStates.size(1), weights.size(2))
       << "hiddenStates and weights shapes not match.";
+  TVM_FFI_ICHECK_EQ(numExperts, weights.size(0))
+      << "weights and expert num not match.";
 
   auto const device = hiddenStates.device();
   auto const stream = get_stream(device);
   int32_t const M = hiddenStates.size(0);
-  int32_t const N = weights.size(0);
+  int32_t const N = weights.size(1);
   int32_t const K = hiddenStates.size(1) * 2;
   TVM_FFI_ICHECK_EQ(output.size(0), M) << "output buffer size not match M.";
   TVM_FFI_ICHECK_EQ(output.size(1), N) << "output buffer size not match N.";
@@ -2255,15 +2257,15 @@ void TllmNvfp4BatchedGemm(
       .weightLayout = batchedGemm::gemm::MatrixLayout::MajorK};
 
   TrtllmGenBatchedGemmRunner runner{options};
-  int32_t const configIdx = tactic >= 0
-                                ? tactic
-                                : runner.getDefaultValidConfigIndex(
-                                      M, N, K, {}, numTokens, numExperts, maxNumCtasInBatchDim);
-  int32_t const workspaceSize = runner.getWorkspaceSizeInBytes(M, N, K, {}, numTokens, numExperts,
-                                                               maxNumCtasInBatchDim, configIdx);
+  int32_t const configIdx =
+      tactic >= 0 ? tactic
+                  : runner.getDefaultValidConfigIndex(numTokens, N, K, {}, numTokens, numExperts,
+                                                      maxNumCtasInBatchDim);
+  int32_t const workspaceSize = runner.getWorkspaceSizeInBytes(
+      numTokens, N, K, {}, numTokens, numExperts, maxNumCtasInBatchDim, configIdx);
   auto workspace = alloc_tensor({workspaceSize}, dl_int8, device);
   runner.run(
-      M, N, K, {},  // batchedTokens. not used since we are using dynamic batch
+      numTokens, N, K, {},  // batchedTokens. not used since we are using dynamic batch
       static_cast<int32_t>(numTokens), static_cast<int32_t>(numExperts),
       static_cast<int32_t>(maxNumCtasInBatchDim), hiddenStates.data_ptr(),
       hiddenStatesScale.data_ptr(), weights.data_ptr(), weightsScale.data_ptr(),
@@ -2284,20 +2286,17 @@ void TllmNvfp4BatchedGemm(
       static_cast<int32_t const*>(totalNumPaddedTokens.data_ptr()),
       static_cast<int32_t const*>(ctaIdxXyToBatchIdx.data_ptr()),
       static_cast<int32_t const*>(ctaIdxXyToMnLimit.data_ptr()),
-      static_cast<int32_t const*>(numNonExistingCtas.data_ptr()), workspace.data_ptr(), stream,
+      static_cast<int32_t const*>(numNonExitingCtas.data_ptr()), workspace.data_ptr(), stream,
       device.device_id, configIdx, enablePDL);
 }
 
-__device__ __forceinline__ float atomicMax(float *address, float val)
-{
-    int ret = __float_as_int(*address);
-    while(val > __int_as_float(ret))
-    {
-        int old = ret;
-        if((ret = atomicCAS((int *)address, old, __float_as_int(val))) == old)
-            break;
-    }
-    return __int_as_float(ret);
+__device__ __forceinline__ float atomicMax(float* address, float val) {
+  int ret = __float_as_int(*address);
+  while (val > __int_as_float(ret)) {
+    int old = ret;
+    if ((ret = atomicCAS((int*)address, old, __float_as_int(val))) == old) break;
+  }
+  return __int_as_float(ret);
 }
 
 template <typename T, uint32_t topK, uint32_t block_size, bool packedTopkIds = true>
@@ -2337,15 +2336,15 @@ __global__ void tllmPermuteAndPerExpertQuanizeKernel(int const numTokens, int co
   }
 }
 
-#define DISPATCH_TLLM_PERMUTE_KERNEL(DTYPE, TOP_K, BLOCK_SIZE)                                  \
-  tllmPermuteAndPerExpertQuanizeKernel<DTYPE, TOP_K, BLOCK_SIZE>                                \
-      <<<gridSize, blockSize, globalExpertNum * 4>>>(                                           \
-          numTokens, hiddenSize, tileSize, static_cast<DTYPE*>(hiddenStates.data_ptr()),        \
-          static_cast<DTYPE*>(permutedHiddenStates.data_ptr()),                                 \
-          static_cast<int32_t*>(topkIdsPacked.data_ptr()),                                      \
-          static_cast<int32_t*>(expandedTokenIdxToPermutedIdx.data_ptr()),                      \
+#define DISPATCH_TLLM_PERMUTE_KERNEL(DTYPE, TOP_K, BLOCK_SIZE)                              \
+  tllmPermuteAndPerExpertQuanizeKernel<DTYPE, TOP_K, BLOCK_SIZE>                            \
+      <<<gridSize, blockSize, globalExpertNum * 4>>>(                                       \
+          numTokens, hiddenSize, tileSize, static_cast<DTYPE*>(hiddenStates.data_ptr()),    \
+          static_cast<DTYPE*>(permutedHiddenStates.data_ptr()),                             \
+          static_cast<int32_t*>(topkIdsPacked.data_ptr()),                                  \
+          static_cast<int32_t*>(expandedTokenIdxToPermutedIdx.data_ptr()),                  \
           perExpertAmax.has_value() ? static_cast<float*>(perExpertAmax.value().data_ptr()) \
-                                      : nullptr);
+                                    : nullptr);
 
 // return: totalNumPaddedTokens,expandedTokenIdxToPermutedIdx, ctaIdxXyToBatchIdx,
 //         ctaIdxXyToMnLimit, numNonExitingCtas, permutedHiddenStates

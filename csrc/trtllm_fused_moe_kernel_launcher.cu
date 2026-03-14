@@ -2194,8 +2194,8 @@ void TllmNvfp4BatchedGemm(
     int64_t const numTokens, int64_t const numExperts, int64_t const topK, int64_t const tileSize,
     int64_t const tactic, bool const fuseActivation, bool const enablePDL,
     // normal input buffers
-    TensorView const& hiddenStates, TensorView const& hiddenStatesScale, TensorView const& weights,
-    TensorView const& weightsScale, Optional<TensorView> bias,
+    TensorView const& activation, TensorView const& activationScale, TensorView const& weights,
+    TensorView const& weightsScale, Optional<TensorView> bias, Optional<TensorView> expertWeights,
     // swiglu params. size [numExperts]
     Optional<TensorView> swigluAlpha, Optional<TensorView> swigluBeta,
     Optional<TensorView> swigluClampLimit,
@@ -2203,6 +2203,7 @@ void TllmNvfp4BatchedGemm(
     int64_t const maxNumCtasInBatchDim, TensorView const& totalNumPaddedTokens,
     TensorView const& numNonExitingCtas, TensorView const& ctaIdxXyToBatchIdx,
     TensorView const& ctaIdxXyToMnLimit, Optional<TensorView> routeMap,
+    Optional<TensorView> expandedIdxToPermutedIdx,
     // scales for Llamma4
     Optional<TensorView> tokenScales,
     // scales for output. size [numExperts]
@@ -2210,30 +2211,34 @@ void TllmNvfp4BatchedGemm(
     // scales for gated output when using swiglu. size [numExperts]
     Optional<TensorView> outputScalesGate,
     // output
-    TensorView output) {
+    bool doFinalize, TensorView output) {
   TVM_FFI_ICHECK_EQ(output.ndim(), 2) << "output buffer dimension must be 2.";
-  TVM_FFI_ICHECK_EQ(hiddenStates.ndim(), 2) << "hiddenStates dimension must be 2.";
+  TVM_FFI_ICHECK_EQ(activation.ndim(), 2) << "activation dimension must be 2.";
   TVM_FFI_ICHECK_EQ(weights.ndim(), 3) << "weights dimension must be 3.";
   TVM_FFI_ICHECK_EQ(output.dtype(), dl_bfloat16) << "output buffer must be bfloat16.";
-  TVM_FFI_ICHECK_EQ(hiddenStates.dtype(), dl_uint8)
-      << "hiddenStates must be uint8 (representing packed nvfp4).";
+  TVM_FFI_ICHECK_EQ(activation.dtype(), dl_uint8)
+      << "activation must be uint8 (representing packed nvfp4).";
   TVM_FFI_ICHECK_EQ(weights.dtype(), dl_uint8)
       << "weights must be uint8 (representing packed nvfp4).";
   TVM_FFI_ICHECK_EQ(totalNumPaddedTokens.numel(), 1)
       << "totalNumPaddedTokens must have exactly 1 element.";
   TVM_FFI_ICHECK_EQ(numNonExitingCtas.numel(), 1)
       << "numNonExitingCtas must have exactly 1 element.";
-  TVM_FFI_ICHECK_EQ(hiddenStates.size(1), weights.size(2))
-      << "hiddenStates and weights shapes not match.";
-  TVM_FFI_ICHECK_EQ(numExperts, weights.size(0))
-      << "weights and expert num not match.";
+  TVM_FFI_ICHECK_EQ(activation.size(1), weights.size(2))
+      << "activation and weights shapes not match.";
+  TVM_FFI_ICHECK_EQ(numExperts, weights.size(0)) << "weights and expert num not match.";
 
-  auto const device = hiddenStates.device();
+  auto const device = activation.device();
   auto const stream = get_stream(device);
-  int32_t const M = hiddenStates.size(0);
+  int32_t const M = activation.size(0);
   int32_t const N = weights.size(1);
-  int32_t const K = hiddenStates.size(1) * 2;
-  TVM_FFI_ICHECK_EQ(output.size(0), M) << "output buffer size not match M.";
+  int32_t const K = activation.size(1) * 2;
+  if (doFinalize) {
+    TVM_FFI_ICHECK_EQ(output.size(0), numTokens)
+        << "output buffer size must be token num when doFinalize is true.";
+  } else {
+    TVM_FFI_ICHECK_EQ(output.size(0), M) << "output buffer size not match M.";
+  }
   TVM_FFI_ICHECK_EQ(output.size(1), N) << "output buffer size not match N.";
 
   // int32_t const maxCtasInBatchDimPerExpert = ceil_div(numTokens, tileSize);
@@ -2264,11 +2269,15 @@ void TllmNvfp4BatchedGemm(
   int32_t const workspaceSize = runner.getWorkspaceSizeInBytes(
       numTokens, N, K, {}, numTokens, numExperts, maxNumCtasInBatchDim, configIdx);
   auto workspace = alloc_tensor({workspaceSize}, dl_int8, device);
+  Tensor outputBuffer;
+  if (doFinalize) {
+    outputBuffer = alloc_tensor({M, K}, dl_bfloat16, device);
+  }
   runner.run(
       numTokens, N, K, {},  // batchedTokens. not used since we are using dynamic batch
       static_cast<int32_t>(numTokens), static_cast<int32_t>(numExperts),
-      static_cast<int32_t>(maxNumCtasInBatchDim), hiddenStates.data_ptr(),
-      hiddenStatesScale.data_ptr(), weights.data_ptr(), weightsScale.data_ptr(),
+      static_cast<int32_t>(maxNumCtasInBatchDim), activation.data_ptr(), activationScale.data_ptr(),
+      weights.data_ptr(), weightsScale.data_ptr(),
       tokenScales.has_value() ? tokenScales.value().data_ptr() : nullptr,  // perTokensSfA
       nullptr,                                                             // perTokenSfB
       outputScales.has_value() ? static_cast<float const*>(outputScales.value().data_ptr())
@@ -2280,14 +2289,41 @@ void TllmNvfp4BatchedGemm(
       swigluBeta.has_value() ? static_cast<float const*>(swigluBeta.value().data_ptr()) : nullptr,
       swigluClampLimit.has_value() ? static_cast<float const*>(swigluClampLimit.value().data_ptr())
                                    : nullptr,
-      output.data_ptr(),  // c
-      nullptr,            // outSfC
+      doFinalize ? outputBuffer.data_ptr() : output.data_ptr(),  // c
+      nullptr,                                                   // outSfC
       routeMap.has_value() ? static_cast<int32_t const*>(routeMap.value().data_ptr()) : nullptr,
       static_cast<int32_t const*>(totalNumPaddedTokens.data_ptr()),
       static_cast<int32_t const*>(ctaIdxXyToBatchIdx.data_ptr()),
       static_cast<int32_t const*>(ctaIdxXyToMnLimit.data_ptr()),
       static_cast<int32_t const*>(numNonExitingCtas.data_ptr()), workspace.data_ptr(), stream,
       device.device_id, configIdx, enablePDL);
+
+  if (doFinalize) {
+    TVM_FFI_CHECK(expandedIdxToPermutedIdx.has_value(),
+                  "expandedIdxToPermutedIdx must be provided when doFinalize is true.");
+    moe::dev::finalize::Data finalizeData;
+    finalizeData.mDtypeElt = btg::Dtype::Bfloat16;
+    finalizeData.mDtypeExpW = btg::Dtype::Bfloat16;
+    finalizeData.mUsePdl = enablePDL;
+    finalizeData.mUseDeepSeekFp8 = false;
+    finalizeData.inPtr = outputBuffer.data_ptr();
+    finalizeData.outPtr = output.data_ptr();
+    finalizeData.inDqSfsPtr = nullptr;
+    finalizeData.outDqSfsPtr = nullptr;
+    finalizeData.expertWeightsPtr =
+        expertWeights.has_value() ? expertWeights.value().data_ptr() : nullptr;
+    finalizeData.expandedIdxToPermutedIdx =
+        static_cast<int32_t*>(expandedIdxToPermutedIdx.value().data_ptr());
+    finalizeData.numTokens = numTokens;
+    finalizeData.numExperts = numExperts;
+    finalizeData.topK = topK;
+    // We want to fuse unpadding into the finalize kernel, so we need to use the output hidden size.
+    finalizeData.hiddenDim = output.size(1);
+    finalizeData.hiddenDimPadded = output.size(1);
+    finalizeData.totalNumPaddedTokens = static_cast<int32_t*>(totalNumPaddedTokens.data_ptr());
+    // Run finalize
+    moe::dev::finalize::run(finalizeData, stream);
+  }
 }
 
 __device__ __forceinline__ float atomicMax(float* address, float val) {
@@ -2429,6 +2465,57 @@ Array<Tensor> TllmPermute(
           numNonExitingCtas,    permutedHiddenStates};
 }
 
+template <typename T, uint32_t block_size>
+__global__ void tllmUnpermuteKernel(int const rows, int const columns, int const topK,
+                                    T* permutedTensor, T* outputTensor,
+                                    int* expandedTokenIdxToPermutedIdx) {
+  int row = blockIdx.x;
+  int col = threadIdx.x;
+  for (int i = col; i < columns; i += block_size) {
+    T element = 0;
+    for (int j = 0; j < topK; ++j) {
+      int const permutedRow = expandedTokenIdxToPermutedIdx[row * topK + j];
+      if (permutedRow < 0) continue;
+      element += permutedTensor[permutedRow * columns + i];
+    }
+    outputTensor[row * columns + i] = element;
+  }
+}
+
+#define DISPATCH_TLLM_UNPERMUTE_KERNEL(DTYPE, BLOCK_SIZE)                                     \
+  tllmUnpermuteKernel<DTYPE, BLOCK_SIZE><<<gridSize, blockSize>>>(                            \
+      rows, columns, static_cast<int32_t>(topK), static_cast<DTYPE*>(inputTensor.data_ptr()), \
+      static_cast<DTYPE*>(outputTensor.data_ptr()),                                           \
+      static_cast<int32_t*>(expandedTokenIdxToPermutedIdx.data_ptr()));
+
+void TllmUnpermute(int64_t const topK, TensorView const& expandedTokenIdxToPermutedIdx,
+                   TensorView const& inputTensor, TensorView const& outputTensor) {
+  TVM_FFI_ICHECK_EQ(expandedTokenIdxToPermutedIdx.dtype(), dl_int32)
+      << "expandedTokenIdxToPermutedIdx must be a int32 tensor.";
+  TVM_FFI_ICHECK_EQ(inputTensor.ndim(), 2) << "input tensor dimension must be 2.";
+  TVM_FFI_ICHECK_EQ(outputTensor.ndim(), 2) << "output tensor dimension must be 2.";
+  TVM_FFI_ICHECK_EQ(inputTensor.size(1), outputTensor.size(1))
+      << "intput and output tensor size doesn't match.";
+  int32_t const rows = outputTensor.size(0);
+  int32_t const columns = outputTensor.size(1);
+  uint32_t constexpr blockSize = 256;
+  uint32_t const gridSize = rows;
+  switch (encode_dlpack_dtype(inputTensor.dtype())) {
+    case encode_dlpack_dtype(dl_float32):
+      DISPATCH_TLLM_UNPERMUTE_KERNEL(float, 256);
+      break;
+    case encode_dlpack_dtype(dl_bfloat16):
+      DISPATCH_TLLM_UNPERMUTE_KERNEL(__nv_bfloat16, 256);
+      break;
+    case encode_dlpack_dtype(dl_float16):
+      DISPATCH_TLLM_UNPERMUTE_KERNEL(__half, 256);
+      break;
+    default:
+      TVM_FFI_LOG_AND_THROW(NotImplementedError)
+          << "Unsupported data type for trtllm-gen unpermute kernel.";
+  }
+}
+
 namespace trtllm_cubin_loader {
 #include <flashinfer/cubin_loader.h>
 }
@@ -2441,5 +2528,6 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_mxint4_block_scale_moe, trtllm_mxint4_block
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_get_valid_moe_configs, trtllm_get_valid_moe_configs);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_nvfp4_batched_gemm, TllmNvfp4BatchedGemm);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_permute, TllmPermute);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_unpermute, TllmUnpermute);
 
 }  // namespace flashinfer

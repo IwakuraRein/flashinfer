@@ -560,7 +560,7 @@ Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8
                bool useExplicitQuantization)
     : mUseExplicitQuantization(useExplicitQuantization),
       mPermuteGemm1(PermuteGemm1::Runner(dtypeAct, dtypeWeights,
-                                         useExplicitQuantization ? btg::Dtype::Bfloat16 : dtypeAct,
+                                         useExplicitQuantization ? btg::Dtype::Fp32 : dtypeAct,
                                          useDeepSeekFp8, tileTokensDim, activationType,
                                          useShuffledMatrix, weightLayout, usePerTokenScaling)),
       mGemm2(Gemm2::Runner(dtypeAct, dtypeWeights, btg::Dtype::Bfloat16, useDeepSeekFp8,
@@ -733,9 +733,9 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
     gemm2_input_scale = workspace.activation_output_scale;
   } else if (mUseExplicitQuantization) {
     // TODO(siyuan): currently only support per-token nvfp4 quantization
-    FLASHINFER_CHECK(
-        mPermuteGemm1.mDtypeOutput == btg::Dtype::Bfloat16,
-        "When using explicit quantization, PermuteGemm1 output dtype must be Bfloat16.");
+    // FLASHINFER_CHECK(
+    //     mPermuteGemm1.mDtypeOutput == btg::Dtype::Bfloat16,
+    //     "When using explicit quantization, PermuteGemm1 output dtype must be Bfloat16.");
     FLASHINFER_CHECK(mGemm2.mDtypeAct == btg::Dtype::E2m1,
                      "Currently only support NvFP4 when using explicit quantization.");
     FLASHINFER_CHECK(
@@ -747,13 +747,23 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
 
     // TODO(siyuan): should this value be exposed?
     float globalScaleInv = 1.f / 448.f / 6.f;
-    invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
-        args.num_tokens * args.top_k, args.intermediate_size,
-        reinterpret_cast<__nv_bfloat16 const*>(workspace.gemm1_output), globalScaleInv,
-        workspace.expanded_idx_to_permuted_idx,
-        reinterpret_cast<uint8_t*>(workspace.activation_output),
-        reinterpret_cast<uint8_t*>(workspace.activation_output_scale),
-        reinterpret_cast<float*>(workspace.token_scales_fc2), sfLayout, stream);
+    if (mPermuteGemm1.mDtypeOutput == btg::Dtype::Bfloat16) {
+      invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
+          args.num_tokens * args.top_k, args.intermediate_size,
+          reinterpret_cast<__nv_bfloat16 const*>(workspace.gemm1_output), globalScaleInv,
+          workspace.expanded_idx_to_permuted_idx,
+          reinterpret_cast<uint8_t*>(workspace.activation_output),
+          reinterpret_cast<uint8_t*>(workspace.activation_output_scale),
+          reinterpret_cast<float*>(workspace.token_scales_fc2), sfLayout, stream);
+    } else {
+      invokeNvfp4QuantAndPerTokenScale<float>(
+          args.num_tokens * args.top_k, args.intermediate_size,
+          reinterpret_cast<float const*>(workspace.gemm1_output), globalScaleInv,
+          workspace.expanded_idx_to_permuted_idx,
+          reinterpret_cast<uint8_t*>(workspace.activation_output),
+          reinterpret_cast<uint8_t*>(workspace.activation_output_scale),
+          reinterpret_cast<float*>(workspace.token_scales_fc2), sfLayout, stream);
+    }
 
     gemm2_input = workspace.activation_output;
     gemm2_input_scale = workspace.activation_output_scale;

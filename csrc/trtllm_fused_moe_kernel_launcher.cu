@@ -1671,12 +1671,12 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
       gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden},
                                   mDtypeAct == btg::Dtype::Bfloat16 ? dl_bfloat16 : dl_uint8,
                                   hidden_states.device());
-    } else {  // FC1 output is Bfloat16
+    } else {  // FC1 output is FP32
       TVM_FFI_ICHECK(mDtypeAct == btg::Dtype::E2m1)
           << "NvFP4 MoE: currently only support NvFP4 x NvFP4 when using per-token scaling.";
       // When per-token scales are used, the FC1 output is always BF16 and will be quantized
       gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, args->intermediate_size},
-                                  dl_bfloat16, hidden_states.device());
+                                  dl_float32, hidden_states.device());
       activation_output = alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden}, dl_uint8,
                                        hidden_states.device());
       per_token_scales_fc2 =

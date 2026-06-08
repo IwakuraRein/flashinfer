@@ -96,6 +96,18 @@ class RoutingInputMode(IntEnum):
     UnpackedPrecomputed = 2
 
 
+def _normalize_kernel_name_filter(kernel_name_filter: Optional[str]) -> str:
+    return "" if kernel_name_filter is None else kernel_name_filter
+
+
+def _moe_autotune_op_name(
+    op_name: str, kernel_name_filter_fc1: str, kernel_name_filter_fc2: str
+) -> str:
+    if not kernel_name_filter_fc1 and not kernel_name_filter_fc2:
+        return op_name
+    return f"{op_name}|{kernel_name_filter_fc1!r}|{kernel_name_filter_fc2!r}"
+
+
 @functools.cache
 def is_trtllm_moe_supported(
     dtype_weights: DtypeTrtllmGen,
@@ -1083,6 +1095,8 @@ def get_trtllm_moe_sm100_module():
             use_packed_weights: bool = False,
             use_per_token_scaling: bool = False,
             num_experts: Optional[int] = None,
+            kernel_name_filter_fc1: str = "",
+            kernel_name_filter_fc2: str = "",
         ):
             self.num_local_experts = num_local_experts
             self.top_k = top_k
@@ -1099,6 +1113,8 @@ def get_trtllm_moe_sm100_module():
             self.num_experts = (
                 num_experts if num_experts is not None else num_local_experts
             )
+            self.kernel_name_filter_fc1 = kernel_name_filter_fc1
+            self.kernel_name_filter_fc2 = kernel_name_filter_fc2
 
         def _make_tuning_config(
             self,
@@ -1214,6 +1230,8 @@ def get_trtllm_moe_sm100_module():
                 self.weight_layout,
                 self.use_per_token_scaling,
                 num_tokens,
+                self.kernel_name_filter_fc1,
+                self.kernel_name_filter_fc2,
             )
             if instance_key not in MoERunner.valid_tactics_dict:
                 try:
@@ -1311,6 +1329,8 @@ def get_trtllm_moe_sm100_module():
                     self.activation_type,
                     kwargs.get("norm_topk_prob", True),
                     kwargs.get("routing_replay_out"),
+                    self.kernel_name_filter_fc1,
+                    self.kernel_name_filter_fc2,
                 )
             elif (
                 self.dtype_act == DtypeTrtllmGen.E4m3
@@ -1372,6 +1392,8 @@ def get_trtllm_moe_sm100_module():
                         self.activation_type,
                         kwargs.get("norm_topk_prob", True),
                         kwargs.get("routing_replay_out"),
+                        self.kernel_name_filter_fc1,
+                        self.kernel_name_filter_fc2,
                     )
                 else:
                     # FP8 per tensor scale
@@ -1401,6 +1423,8 @@ def get_trtllm_moe_sm100_module():
                         self.activation_type,
                         kwargs.get("norm_topk_prob", True),
                         kwargs.get("routing_replay_out"),
+                        self.kernel_name_filter_fc1,
+                        self.kernel_name_filter_fc2,
                     )
             elif (
                 self.dtype_act == DtypeTrtllmGen.Bfloat16
@@ -1432,6 +1456,8 @@ def get_trtllm_moe_sm100_module():
                     [-1, -1] if tactic == -1 else tactic,
                     kwargs.get("norm_topk_prob", True),
                     kwargs.get("routing_replay_out"),
+                    self.kernel_name_filter_fc1,
+                    self.kernel_name_filter_fc2,
                 )
             else:
                 moe_op.trtllm_fp4_block_scale_moe(
@@ -1471,6 +1497,8 @@ def get_trtllm_moe_sm100_module():
                     [-1, -1] if tactic == -1 else tactic,
                     kwargs.get("norm_topk_prob", True),
                     kwargs.get("routing_replay_out"),
+                    self.kernel_name_filter_fc1,
+                    self.kernel_name_filter_fc2,
                 )
 
     @register_custom_op(
@@ -1502,6 +1530,8 @@ def get_trtllm_moe_sm100_module():
         activation_type: int = ActivationType.Swiglu.value,
         norm_topk_prob: bool = True,
         routing_replay_out: Optional[torch.Tensor] = None,
+        kernel_name_filter_fc1: str = "",
+        kernel_name_filter_fc2: str = "",
     ) -> List[torch.Tensor]:
         assert routing_logits is not None or topk_ids is not None, (
             "either routing_logits or topk_ids must be provided"
@@ -1551,6 +1581,8 @@ def get_trtllm_moe_sm100_module():
             use_shuffled_weight=use_shuffled_weight,
             activation_type=activation_type,
             num_experts=num_experts,
+            kernel_name_filter_fc1=kernel_name_filter_fc1,
+            kernel_name_filter_fc2=kernel_name_filter_fc2,
         )
 
         moe_inputs = MoEInputs(
@@ -1570,7 +1602,11 @@ def get_trtllm_moe_sm100_module():
         )
 
         _, tactic = tuner.choose_one(
-            "flashinfer::trtllm_bf16_moe",
+            _moe_autotune_op_name(
+                "flashinfer::trtllm_bf16_moe",
+                kernel_name_filter_fc1,
+                kernel_name_filter_fc2,
+            ),
             [moe_runner],
             tuning_config,
             moe_inputs.to_list(),
@@ -1618,6 +1654,8 @@ def get_trtllm_moe_sm100_module():
             activation_type,
             norm_topk_prob,
             routing_replay_out,
+            kernel_name_filter_fc1,
+            kernel_name_filter_fc2,
         )
         if do_finalize:
             return [output]
@@ -1654,8 +1692,10 @@ def get_trtllm_moe_sm100_module():
         activation_type: int = ActivationType.Swiglu.value,
         norm_topk_prob: bool = True,
         routing_replay_out: Optional[torch.Tensor] = None,
+        kernel_name_filter_fc1: str = "",
+        kernel_name_filter_fc2: str = "",
     ) -> List[torch.Tensor]:
-        _ = routing_replay_out
+        _ = routing_replay_out, kernel_name_filter_fc1, kernel_name_filter_fc2
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
 
@@ -1690,6 +1730,8 @@ def get_trtllm_moe_sm100_module():
         activation_type: int = ActivationType.Swiglu.value,
         norm_topk_prob: bool = True,
         routing_replay_out: Optional[torch.Tensor] = None,
+        kernel_name_filter_fc1: str = "",
+        kernel_name_filter_fc2: str = "",
     ) -> List[torch.Tensor]:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
@@ -1725,6 +1767,8 @@ def get_trtllm_moe_sm100_module():
             use_shuffled_weight=True,
             activation_type=activation_type,
             num_experts=num_experts,
+            kernel_name_filter_fc1=kernel_name_filter_fc1,
+            kernel_name_filter_fc2=kernel_name_filter_fc2,
         )
 
         moe_inputs = MoEInputs(
@@ -1744,7 +1788,11 @@ def get_trtllm_moe_sm100_module():
         )
 
         _, tactic = tuner.choose_one(
-            "flashinfer::trtllm_fp8_per_tensor_scale_moe",
+            _moe_autotune_op_name(
+                "flashinfer::trtllm_fp8_per_tensor_scale_moe",
+                kernel_name_filter_fc1,
+                kernel_name_filter_fc2,
+            ),
             [moe_runner],
             tuning_config,
             moe_inputs.to_list(),
@@ -1793,6 +1841,8 @@ def get_trtllm_moe_sm100_module():
             activation_type,
             norm_topk_prob,
             routing_replay_out,
+            kernel_name_filter_fc1,
+            kernel_name_filter_fc2,
         )
         if do_finalize:
             return [output]
@@ -1829,8 +1879,10 @@ def get_trtllm_moe_sm100_module():
         activation_type: int = ActivationType.Swiglu.value,
         norm_topk_prob: bool = True,
         routing_replay_out: Optional[torch.Tensor] = None,
+        kernel_name_filter_fc1: str = "",
+        kernel_name_filter_fc2: str = "",
     ):
-        _ = routing_replay_out
+        _ = routing_replay_out, kernel_name_filter_fc1, kernel_name_filter_fc2
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
 
@@ -1870,6 +1922,8 @@ def get_trtllm_moe_sm100_module():
         activation_type: int = ActivationType.Swiglu.value,
         norm_topk_prob: bool = True,
         routing_replay_out: Optional[torch.Tensor] = None,
+        kernel_name_filter_fc1: str = "",
+        kernel_name_filter_fc2: str = "",
     ) -> List[torch.Tensor]:
         # Determine routing mode: compute from logits or use pre-computed
         if routing_logits is None:
@@ -1946,6 +2000,8 @@ def get_trtllm_moe_sm100_module():
             weight_layout=weight_layout,
             use_shuffled_weight=use_shuffled_weight,
             num_experts=num_experts,
+            kernel_name_filter_fc1=kernel_name_filter_fc1,
+            kernel_name_filter_fc2=kernel_name_filter_fc2,
         )
 
         moe_inputs = MoEInputs(
@@ -1965,7 +2021,11 @@ def get_trtllm_moe_sm100_module():
         )
 
         _, tactic = tuner.choose_one(
-            "flashinfer::trtllm_fp8_block_scale_moe",
+            _moe_autotune_op_name(
+                "flashinfer::trtllm_fp8_block_scale_moe",
+                kernel_name_filter_fc1,
+                kernel_name_filter_fc2,
+            ),
             [moe_runner],
             tuning_config,
             moe_inputs.to_list(),
@@ -2017,6 +2077,8 @@ def get_trtllm_moe_sm100_module():
             activation_type,
             norm_topk_prob,
             routing_replay_out,
+            kernel_name_filter_fc1,
+            kernel_name_filter_fc2,
         )
 
         if do_finalize:
@@ -2063,8 +2125,10 @@ def get_trtllm_moe_sm100_module():
         activation_type: int = ActivationType.Swiglu.value,
         norm_topk_prob: bool = True,
         routing_replay_out: Optional[torch.Tensor] = None,
+        kernel_name_filter_fc1: str = "",
+        kernel_name_filter_fc2: str = "",
     ) -> List[torch.Tensor]:
-        _ = routing_replay_out
+        _ = routing_replay_out, kernel_name_filter_fc1, kernel_name_filter_fc2
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
 
@@ -2111,6 +2175,8 @@ def get_trtllm_moe_sm100_module():
         tune_max_num_tokens: int = 8192,
         norm_topk_prob: bool = True,
         routing_replay_out: Optional[torch.Tensor] = None,
+        kernel_name_filter_fc1: str = "",
+        kernel_name_filter_fc2: str = "",
     ) -> List[torch.Tensor]:
         if routing_logits is None:
             assert topk_ids is not None, (
@@ -2182,6 +2248,8 @@ def get_trtllm_moe_sm100_module():
             use_shuffled_weight=True,
             use_per_token_scaling=per_token_scale is not None,
             num_experts=num_experts,
+            kernel_name_filter_fc1=kernel_name_filter_fc1,
+            kernel_name_filter_fc2=kernel_name_filter_fc2,
         )
         moe_inputs = MoEInputs(
             output=output,
@@ -2200,7 +2268,11 @@ def get_trtllm_moe_sm100_module():
         )
 
         _, tactic = tuner.choose_one(
-            "flashinfer::trtllm_fp4_block_scale_moe",
+            _moe_autotune_op_name(
+                "flashinfer::trtllm_fp4_block_scale_moe",
+                kernel_name_filter_fc1,
+                kernel_name_filter_fc2,
+            ),
             [moe_runner],
             tuning_config,
             moe_inputs.to_list(),
@@ -2268,6 +2340,8 @@ def get_trtllm_moe_sm100_module():
             [-1, -1] if tactic == -1 else tactic,
             norm_topk_prob,
             routing_replay_out,
+            kernel_name_filter_fc1,
+            kernel_name_filter_fc2,
         )
         if do_finalize:
             return [output]
@@ -2316,8 +2390,10 @@ def get_trtllm_moe_sm100_module():
         tune_max_num_tokens: int = 8192,
         norm_topk_prob: bool = True,
         routing_replay_out: Optional[torch.Tensor] = None,
+        kernel_name_filter_fc1: str = "",
+        kernel_name_filter_fc2: str = "",
     ):
-        _ = routing_replay_out
+        _ = routing_replay_out, kernel_name_filter_fc1, kernel_name_filter_fc2
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1] if output is None else output.shape[1]
 
@@ -2353,6 +2429,8 @@ def get_trtllm_moe_sm100_module():
         tune_max_num_tokens: int = 8192,
         norm_topk_prob: bool = True,
         routing_replay_out: Optional[torch.Tensor] = None,
+        kernel_name_filter_fc1: str = "",
+        kernel_name_filter_fc2: str = "",
     ) -> List[torch.Tensor]:
         routing_dtype = routing_logits.dtype
         hidden_size = hidden_states.shape[-1]
@@ -2392,6 +2470,8 @@ def get_trtllm_moe_sm100_module():
             weight_layout=WeightLayout.BlockMajorK,
             use_shuffled_weight=True,
             num_experts=num_experts,
+            kernel_name_filter_fc1=kernel_name_filter_fc1,
+            kernel_name_filter_fc2=kernel_name_filter_fc2,
         )
 
         moe_inputs = MoEInputs(
@@ -2411,7 +2491,11 @@ def get_trtllm_moe_sm100_module():
         )
 
         _, tactic = tuner.choose_one(
-            "flashinfer::trtllm_mxint4_block_scale_moe",
+            _moe_autotune_op_name(
+                "flashinfer::trtllm_mxint4_block_scale_moe",
+                kernel_name_filter_fc1,
+                kernel_name_filter_fc2,
+            ),
             [moe_runner],
             tuning_config,
             moe_inputs.to_list(),
@@ -2460,6 +2544,8 @@ def get_trtllm_moe_sm100_module():
             [-1, -1] if tactic == -1 else tactic,
             norm_topk_prob,
             routing_replay_out,
+            kernel_name_filter_fc1,
+            kernel_name_filter_fc2,
         )
         if do_finalize:
             return [output]
@@ -2497,8 +2583,10 @@ def get_trtllm_moe_sm100_module():
         tune_max_num_tokens: int = 8192,
         norm_topk_prob: bool = True,
         routing_replay_out: Optional[torch.Tensor] = None,
+        kernel_name_filter_fc1: str = "",
+        kernel_name_filter_fc2: str = "",
     ):
-        _ = routing_replay_out
+        _ = routing_replay_out, kernel_name_filter_fc1, kernel_name_filter_fc2
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
 
@@ -2559,6 +2647,8 @@ def trtllm_bf16_moe(
     activation_type: int = ActivationType.Swiglu.value,
     norm_topk_prob: bool = True,
     routing_replay_out: Optional[torch.Tensor] = None,
+    kernel_name_filter_fc1: Optional[str] = None,
+    kernel_name_filter_fc2: Optional[str] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     """BF16 MoE operation with autotuning support.
 
@@ -2635,6 +2725,8 @@ def trtllm_bf16_moe(
         activation_type,
         norm_topk_prob,
         routing_replay_out,
+        _normalize_kernel_name_filter(kernel_name_filter_fc1),
+        _normalize_kernel_name_filter(kernel_name_filter_fc2),
     )
 
     if do_finalize:
@@ -2668,6 +2760,8 @@ def trtllm_bf16_routed_moe(
     tune_max_num_tokens: int = 8192,
     activation_type: int = ActivationType.Swiglu.value,
     routing_replay_out: Optional[torch.Tensor] = None,
+    kernel_name_filter_fc1: Optional[str] = None,
+    kernel_name_filter_fc2: Optional[str] = None,
 ) -> List[torch.Tensor]:
     """BF16 MoE operation with autotuning support.
 
@@ -2743,6 +2837,8 @@ def trtllm_bf16_routed_moe(
         activation_type,
         True,  # norm_topk_prob: not used for pre-computed routing
         routing_replay_out,
+        _normalize_kernel_name_filter(kernel_name_filter_fc1),
+        _normalize_kernel_name_filter(kernel_name_filter_fc2),
     )
 
     if do_finalize:
@@ -2780,6 +2876,8 @@ def trtllm_fp8_per_tensor_scale_moe(
     activation_type: int = ActivationType.Swiglu.value,
     norm_topk_prob: bool = True,
     routing_replay_out: Optional[torch.Tensor] = None,
+    kernel_name_filter_fc1: Optional[str] = None,
+    kernel_name_filter_fc2: Optional[str] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     """FP8 per tensor scale MoE operation.
 
@@ -2844,6 +2942,8 @@ def trtllm_fp8_per_tensor_scale_moe(
         activation_type,
         norm_topk_prob,
         routing_replay_out,
+        _normalize_kernel_name_filter(kernel_name_filter_fc1),
+        _normalize_kernel_name_filter(kernel_name_filter_fc2),
     )
 
     if do_finalize:
@@ -2883,6 +2983,8 @@ def trtllm_fp8_block_scale_moe(
     activation_type: int = ActivationType.Swiglu.value,
     norm_topk_prob: bool = True,
     routing_replay_out: Optional[torch.Tensor] = None,
+    kernel_name_filter_fc1: Optional[str] = None,
+    kernel_name_filter_fc2: Optional[str] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     """FP8 block scale MoE operation.
 
@@ -2965,6 +3067,8 @@ def trtllm_fp8_block_scale_moe(
         activation_type,
         norm_topk_prob,
         routing_replay_out,
+        _normalize_kernel_name_filter(kernel_name_filter_fc1),
+        _normalize_kernel_name_filter(kernel_name_filter_fc2),
     )
 
     if do_finalize:
@@ -3003,6 +3107,8 @@ def trtllm_fp8_block_scale_routed_moe(
     tune_max_num_tokens: int = 8192,
     fp8_quantization_type: Fp8QuantizationType = Fp8QuantizationType.DeepSeekFp8,
     activation_type: int = ActivationType.Swiglu.value,
+    kernel_name_filter_fc1: Optional[str] = None,
+    kernel_name_filter_fc2: Optional[str] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     """FP8 block scale MoE operation with pre-computed routing (packed format).
 
@@ -3079,6 +3185,9 @@ def trtllm_fp8_block_scale_routed_moe(
         fp8_quantization_type,
         activation_type,
         True,  # norm_topk_prob: not used for pre-computed routing
+        None,  # routing_replay_out
+        _normalize_kernel_name_filter(kernel_name_filter_fc1),
+        _normalize_kernel_name_filter(kernel_name_filter_fc2),
     )
 
     if do_finalize:
@@ -3125,6 +3234,8 @@ def trtllm_fp4_block_scale_moe(
     tune_max_num_tokens: int = 8192,
     norm_topk_prob: bool = True,
     routing_replay_out: Optional[torch.Tensor] = None,
+    kernel_name_filter_fc1: Optional[str] = None,
+    kernel_name_filter_fc2: Optional[str] = None,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation.
 
@@ -3232,6 +3343,8 @@ def trtllm_fp4_block_scale_moe(
         tune_max_num_tokens,
         norm_topk_prob,
         routing_replay_out,
+        _normalize_kernel_name_filter(kernel_name_filter_fc1),
+        _normalize_kernel_name_filter(kernel_name_filter_fc2),
     )
 
 
@@ -3268,6 +3381,8 @@ def trtllm_fp4_block_scale_routed_moe(
     per_token_scale: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
+    kernel_name_filter_fc1: Optional[str] = None,
+    kernel_name_filter_fc2: Optional[str] = None,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation with pre-computed routing.
 
@@ -3393,6 +3508,9 @@ def trtllm_fp4_block_scale_routed_moe(
         output,
         tune_max_num_tokens,
         True,  # norm_topk_prob: not used for pre-computed routing
+        None,  # routing_replay_out
+        _normalize_kernel_name_filter(kernel_name_filter_fc1),
+        _normalize_kernel_name_filter(kernel_name_filter_fc2),
     )
 
 
@@ -3423,6 +3541,8 @@ def trtllm_mxint4_block_scale_moe(
     tune_max_num_tokens: int = 8192,
     norm_topk_prob: bool = True,
     routing_replay_out: Optional[torch.Tensor] = None,
+    kernel_name_filter_fc1: Optional[str] = None,
+    kernel_name_filter_fc2: Optional[str] = None,
 ) -> List[torch.Tensor]:
     """MxInt4 block scale MoE operation.
 
@@ -3500,4 +3620,6 @@ def trtllm_mxint4_block_scale_moe(
         tune_max_num_tokens,
         norm_topk_prob,
         routing_replay_out,
+        _normalize_kernel_name_filter(kernel_name_filter_fc1),
+        _normalize_kernel_name_filter(kernel_name_filter_fc2),
     )

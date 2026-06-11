@@ -65,6 +65,7 @@ from .jit.fused_moe import (
     gen_cutlass_fused_moe_sm100_module,
     gen_cutlass_fused_moe_sm103_module,
     gen_cutlass_fused_moe_sm120_module,
+    gen_trtllm_gen_fused_moe_routing_sm100_module,
     gen_trtllm_gen_fused_moe_sm100_module,
 )
 from .jit.bgmv_moe import gen_bgmv_moe_module
@@ -520,6 +521,7 @@ def gen_all_modules(
             jit_specs.append(gen_mxfp8_quantization_sm100_module())
             jit_specs.append(gen_trtllm_gen_gemm_module())
             jit_specs.append(gen_trtllm_low_latency_gemm_module())
+            jit_specs.append(gen_trtllm_gen_fused_moe_routing_sm100_module())
             jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module())
         if has_sm100f:
             # Add TGV GEMM modules compiled with SM100f flags for both bf16 and fp16

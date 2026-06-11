@@ -1,11 +1,12 @@
 import dataclasses
+import ctypes
 import functools
 import logging
 import os
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Union, Hashable
+from typing import Any, Dict, List, Optional, Sequence, Union, Hashable
 
 import tvm_ffi
 from filelock import FileLock
@@ -212,6 +213,7 @@ class JitSpecRegistry:
 
 # Global registry instance
 jit_spec_registry = JitSpecRegistry()
+_global_library_handles: Dict[str, Any] = {}
 
 
 @dataclasses.dataclass
@@ -224,6 +226,7 @@ class JitSpec:
     extra_include_dirs: Optional[List[Path]]
     is_class: bool = False
     needs_device_linking: bool = False
+    dependencies: Optional[List["JitSpec"]] = None
 
     @property
     def ninja_path(self) -> Path:
@@ -304,17 +307,41 @@ class JitSpec:
     def load(self, so_path: Path):
         return tvm_ffi.load_module(str(so_path))
 
-    def build_and_load(self):
+    def build_and_load(self, global_visibility: bool = False):
+        # before loading current module, we need to load dependencies into the process with RTLD_GLOBAL.
+        for dependency in self.dependencies or []:
+            dependency.build_and_load(global_visibility=True)
+
+        so_path = self.get_library_path()
+        key = str(so_path.resolve())
+        if key in _global_library_handles:
+            return _global_library_handles[key][0]
+
         if self.is_aot:
-            return self.load(self.aot_path)
+            ffi_module = self.load(self.aot_path)
+            if global_visibility:
+                with FileLock(self.lock_path, thread_local=False):
+                    if key in _global_library_handles:
+                        return _global_library_handles[key][0]
+                    mode = ctypes.RTLD_GLOBAL | getattr(os, "RTLD_NOW", 0)
+                    cdll = ctypes.CDLL(str(self.aot_path), mode=mode)
+                    _global_library_handles[key] = (ffi_module, cdll)
+            return ffi_module
 
         # Guard both build and load with the same lock to avoid race condition
         # where another process is building the library and removes the .so file.
         with FileLock(self.lock_path, thread_local=False):
             so_path = self.jit_library_path
+            key = str(so_path.resolve())
+            if key in _global_library_handles:
+                return _global_library_handles[key][0]
             verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
             self.build(verbose, need_lock=False)
             result = self.load(so_path)
+            if global_visibility:
+                mode = ctypes.RTLD_GLOBAL | getattr(os, "RTLD_NOW", 0)
+                cdll = ctypes.CDLL(str(so_path), mode=mode)
+                _global_library_handles[key] = (result, cdll)
 
         return result
 
@@ -409,6 +436,7 @@ def gen_jit_spec(
     extra_ldflags: Optional[List[str]] = None,
     extra_include_paths: Optional[List[Union[str, Path]]] = None,
     needs_device_linking: bool = False,
+    dependencies: Optional[List[JitSpec]] = None,
 ) -> JitSpec:
     check_cuda_arch()
     # Use FLASHINFER_JIT_DEBUG if set, otherwise use FLASHINFER_JIT_VERBOSE (for backward compatibility)
@@ -475,6 +503,7 @@ def gen_jit_spec(
             if extra_include_paths is not None
             else None
         ),
+        dependencies=dependencies,
         needs_device_linking=needs_device_linking,
     )
 
@@ -497,6 +526,21 @@ def build_jit_specs(
     verbose: bool = False,
     skip_prebuilt: bool = True,
 ) -> None:
+    # DFS the dependency to get the full list of specs
+    expanded_specs: List[JitSpec] = []
+    seen = set()
+
+    def visit(spec: JitSpec) -> None:
+        for dependency in spec.dependencies or []:
+            visit(dependency)
+        if spec.name not in seen:
+            seen.add(spec.name)
+            expanded_specs.append(spec)
+
+    for spec in specs:
+        visit(spec)
+    specs = expanded_specs
+
     lines: List[str] = []
     for spec in specs:
         if skip_prebuilt and spec.aot_path.exists():

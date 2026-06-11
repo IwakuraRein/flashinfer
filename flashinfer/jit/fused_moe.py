@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import functools
 from typing import List
 
 from . import env as jit_env
@@ -243,7 +244,8 @@ def gen_cutlass_fused_moe_module(
     )
 
 
-def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
+@functools.cache
+def _get_trtllm_gen_fused_moe_include_path() -> List[str]:
     # Fetch "flashinferMetaInfo.h" from the online kernel cache. This file
     # contains the `tllmGenBatchedGemmList` as the list of available kernels
     # online. It is included when compiling `trtllm_fused_moe_runner.cu`, etc.
@@ -279,11 +281,53 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
     ensure_symlink(symlink_path, jit_env.FLASHINFER_CUBIN_DIR / bmm_export_path)
     verify_symlinked_headers(symlink_path, BMM_EXPORT_HEADERS, checksum)
 
+    return [
+        jit_env.FLASHINFER_CUBIN_DIR,
+        jit_env.FLASHINFER_CUBIN_DIR / include_path,
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/include",
+    ]
+
+
+@functools.cache
+def _get_trtllm_gen_fused_moe_sm100_cuda_flags() -> List[str]:
     # currently only support Blackwell
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
         supported_major_versions=[10, 12]
     )
+    return [
+        "-DTLLM_GEN_EXPORT_INTERFACE",
+        "-DTLLM_GEN_EXPORT_FLASHINFER",
+        "-DTLLM_ENABLE_CUDA",
+        "-DENABLE_BF16",
+        "-DENABLE_FP8",
+        "-DENABLE_FP4",
+        "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
+        f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_BMM}\\"',
+    ] + nvcc_flags
 
+
+def gen_trtllm_gen_fused_moe_routing_sm100_module() -> JitSpec:
+    include_path = _get_trtllm_gen_fused_moe_include_path()
+    return gen_jit_spec(
+        "fused_moe_trtllm_routing_sm100",
+        [
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_deepseek.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_llama4.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_common.cu",
+        ],
+        extra_cuda_cflags=_get_trtllm_gen_fused_moe_sm100_cuda_flags(),
+        extra_include_paths=include_path,
+    )
+
+
+def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
+    include_path = _get_trtllm_gen_fused_moe_include_path()
     return gen_jit_spec(
         "fused_moe_trtllm_sm100",
         [
@@ -296,32 +340,10 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_kernel_launcher.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_runner.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_deepseek.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_llama4.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_common.cu",
-            jit_env.FLASHINFER_CSRC_DIR
             / "fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_batched_gemm_runner.cu",
         ],
-        extra_cuda_cflags=[
-            "-DTLLM_GEN_EXPORT_INTERFACE",
-            "-DTLLM_GEN_EXPORT_FLASHINFER",
-            "-DTLLM_ENABLE_CUDA",
-            "-DENABLE_BF16",
-            "-DENABLE_FP8",
-            "-DENABLE_FP4",
-            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
-            f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_BMM}\\"',
-        ]
-        + nvcc_flags,
-        extra_include_paths=[
-            jit_env.FLASHINFER_CUBIN_DIR,
-            jit_env.FLASHINFER_CUBIN_DIR / include_path,
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/include",
-        ],
+        extra_cuda_cflags=_get_trtllm_gen_fused_moe_sm100_cuda_flags(),
+        extra_include_paths=include_path,
+        dependencies=[gen_trtllm_gen_fused_moe_routing_sm100_module()],
     )

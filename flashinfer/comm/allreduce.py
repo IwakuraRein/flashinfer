@@ -590,6 +590,7 @@ def allreduce_fusion(
 
     * AllReduce only
     * AllReduce + Residual + RMSNorm
+    * Residual + RMSNorm + AllReduce (TRT-LLM only)
     * AllReduce + Residual + RMSNorm + Quantization (FP8 / NVFP4)
 
     .. note::
@@ -625,9 +626,11 @@ def allreduce_fusion(
         * ``kARResidualRMSNormOutPerTokenGroupFP8PackedQuant = 9`` (TRT-LLM only)
         * ``kARResidualRMSNormDynamicFP8Quant = 10``
         * ``kARResidualRMSNormOutDynamicFP8Quant = 11``
+        * ``kResidualRMSNormAR = 12`` (TRT-LLM only)
 
         MNNVL supports the standard FP8/NVFP4 quant patterns (2-5) and
         dynamic FP8 patterns (10-11). Packed group quant patterns remain
+        TRT-LLM only. The pre-AllReduce normalization pattern (12) is also
         TRT-LLM only.
 
         ``kMoEFinalizeARResidualRMSNorm`` is available through TRT-LLM and
@@ -643,10 +646,11 @@ def allreduce_fusion(
         ``cudaGridDependencySynchronize()``. Ignored by the MNNVL backend.
     output : Optional[torch.Tensor]
         Pre-allocated AllReduce output buffer, shape
-        ``[token_num, hidden_dim]``.
+        ``[token_num, hidden_dim]``. Required for ``kResidualRMSNormAR``.
     residual_out : Optional[torch.Tensor]
         Pre-allocated pre-norm output (after residual add, before norm),
-        shape ``[token_num, hidden_dim]``.
+        shape ``[token_num, hidden_dim]``. For ``kResidualRMSNormAR``, this
+        is the rank-local residual stream and must be supplied by the caller.
     norm_out : Optional[torch.Tensor]
         Pre-allocated normalized output, shape ``[token_num, hidden_dim]``.
     quant_out : Optional[torch.Tensor]
@@ -718,7 +722,7 @@ def allreduce_fusion(
     torch.Tensor
         Output tensor for the selected pattern. Quant patterns return
         ``quant_out``, RMSNorm patterns return ``norm_out``, and
-        ``kAllReduce`` returns ``output``.
+        ``kAllReduce`` and ``kResidualRMSNormAR`` return ``output``.
 
     Examples
     --------
@@ -866,6 +870,17 @@ def allreduce_fusion(
         # Extract shape from 2D input for the standard TRT-LLM fusion patterns.
         token_num, hidden_dim = input.shape
 
+        if pattern == AllReduceFusionPattern.kResidualRMSNormAR:
+            required = {
+                "output": output,
+                "residual_in": residual_in,
+                "residual_out": residual_out,
+                "rms_gamma": rms_gamma,
+            }
+            missing = [name for name, value in required.items() if value is None]
+            if missing:
+                raise ValueError("kResidualRMSNormAR requires " + ", ".join(missing))
+
         if pattern in [
             AllReduceFusionPattern.kARResidualRMSNormPerTokenGroupFP8PackedQuant,
             AllReduceFusionPattern.kARResidualRMSNormOutPerTokenGroupFP8PackedQuant,
@@ -1008,6 +1023,10 @@ def allreduce_fusion(
             metadata=workspace.metadata,
             block_quant_group_size=block_quant_group_size,
         )
+
+        if pattern == AllReduceFusionPattern.kResidualRMSNormAR:
+            assert output is not None
+            return output
 
         # Return the most downstream output (already in 2D shape from input views)
         if norm_out is not None:

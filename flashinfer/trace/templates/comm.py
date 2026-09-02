@@ -49,21 +49,23 @@ def _allreduce_fusion_reference(
       ``norm_out = rmsnorm(residual_out, weight_bias + rms_gamma, rms_eps)``.
       ``weight_bias=0`` is standard RMSNorm; ``weight_bias=1`` is Gemma /
       Qwen3.5 style (``(1 + gamma) * x * rsqrt(...)``).
+    - pattern 12 (kResidualRMSNormAR): locally computes the same residual and
+      RMSNorm as pattern 1, then writes that normalized value to ``output``.
+      In the real multi-rank operation, ``output`` is the sum of these local
+      normalized values.
 
-    Quantized / MoE patterns (>= 2) are outside the single-rank scope —
-    this reference raises ``NotImplementedError`` for them and callers
-    should exercise the real multi-rank kernel for coverage.
+    Quantized / MoE patterns (2-11) are outside the single-rank scope — this
+    reference raises ``NotImplementedError`` for them and callers should
+    exercise the real multi-rank kernel for coverage.
     """
     if pattern == 0:
         out = input.clone()
         if output is not None:
             output.copy_(out)
         return out
-    if pattern == 1:
+    if pattern in (1, 12):
         if residual_in is None or rms_gamma is None:
-            raise ValueError(
-                "pattern=1 (kARResidualRMSNorm) requires residual_in and rms_gamma"
-            )
+            raise ValueError(f"pattern={pattern} requires residual_in and rms_gamma")
         pre = input.to(torch.float32) + residual_in.to(torch.float32)
         inv_rms = torch.rsqrt(pre.pow(2).mean(dim=-1, keepdim=True) + float(rms_eps))
         normed = (pre * inv_rms) * (float(weight_bias) + rms_gamma.to(torch.float32))
@@ -71,7 +73,10 @@ def _allreduce_fusion_reference(
         normed_dtype = normed.to(input.dtype)
         if residual_out is not None:
             residual_out.copy_(pre_dtype)
-        if norm_out is not None:
+        if pattern == 12:
+            if output is not None:
+                output.copy_(normed_dtype)
+        elif norm_out is not None:
             norm_out.copy_(normed_dtype)
         return normed_dtype
     raise NotImplementedError(
@@ -140,18 +145,19 @@ allreduce_fusion_trace = TraceTemplate(
             description=(
                 "AllReduceFusionPattern enum: 0=AllReduce, "
                 "1=AR+Residual+RMSNorm, 2..5=with FP8/FP4 quant, "
-                "6=MoE reduction, 7=MoE finalize."
+                "6=MoE reduction, 7=MoE finalize, "
+                "12=Residual+RMSNorm+AR (TRT-LLM only)."
             ),
         ),
         "residual_in": Tensor(
             ["num_tokens", "hidden_dim"],
             optional=True,
-            description="Residual to add (patterns 1..5).",
+            description="Residual to add (patterns 1..5 and 12).",
         ),
         "rms_gamma": Tensor(
             ["hidden_dim"],
             optional=True,
-            description="RMSNorm weight (patterns 1..5).",
+            description="RMSNorm weight (patterns 1..5 and 12).",
         ),
         "rms_eps": Scalar("float32", optional=True),
         "weight_bias": Scalar(

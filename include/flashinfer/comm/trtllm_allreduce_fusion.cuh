@@ -835,6 +835,8 @@ enum class AllReduceFusionPattern : int {
   kARResidualRMSNormOutPerTokenGroupFP8PackedQuant = 9,
   kARResidualRMSNormDynamicFP8Quant = 10,
   kARResidualRMSNormOutDynamicFP8Quant = 11,
+  // Residual add and RMSNorm are applied to each rank's local contribution before AllReduce.
+  kResidualRMSNormAR = 12,
 };
 
 enum class QuantType : int {
@@ -848,39 +850,43 @@ enum class QuantType : int {
 template <AllReduceFusionPattern Pattern>
 struct FusionPatternTraits;
 
-#define DEFINE_FUSION_PATTERN_TRAITS(pattern, hasAllReduceOut, hasResidual, hasResidualOut, \
-                                     hasRMSNorm, hasNormOut, quantType)                     \
-  template <>                                                                               \
-  struct FusionPatternTraits<pattern> {                                                     \
-    static constexpr bool kHasAllReduceOut = hasAllReduceOut;                               \
-    static constexpr bool kHasResidual = hasResidual;                                       \
-    static constexpr bool kHasResidualOut = hasResidualOut;                                 \
-    static constexpr bool kHasRMSNorm = hasRMSNorm;                                         \
-    static constexpr bool kHasNormOut = hasNormOut;                                         \
-    static constexpr QuantType kQuantType = quantType;                                      \
+#define DEFINE_FUSION_PATTERN_TRAITS(pattern, hasAllReduceOut, hasResidual, hasResidualOut,     \
+                                     hasRMSNorm, hasNormOut, rmsNormBeforeAllReduce, quantType) \
+  template <>                                                                                   \
+  struct FusionPatternTraits<pattern> {                                                         \
+    static constexpr bool kHasAllReduceOut = hasAllReduceOut;                                   \
+    static constexpr bool kHasResidual = hasResidual;                                           \
+    static constexpr bool kHasResidualOut = hasResidualOut;                                     \
+    static constexpr bool kHasRMSNorm = hasRMSNorm;                                             \
+    static constexpr bool kHasNormOut = hasNormOut;                                             \
+    static constexpr bool kRMSNormBeforeAllReduce = rmsNormBeforeAllReduce;                     \
+    static constexpr QuantType kQuantType = quantType;                                          \
   };
 
 DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kAllReduce, true, false, false, false, false,
-                             QuantType::kNone);
+                             false, QuantType::kNone);
 DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNorm, false, true, true, true,
-                             true, QuantType::kNone);
+                             true, false, QuantType::kNone);
 DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormFP8Quant, false, true, true,
-                             true, false, QuantType::kFP8);
+                             true, false, false, QuantType::kFP8);
 DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormFP4Quant, false, true, true,
-                             true, false, QuantType::kFP4);
+                             true, false, false, QuantType::kFP4);
 DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant, false, true,
-                             true, true, true, QuantType::kFP8);
+                             true, true, true, false, QuantType::kFP8);
 DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant, false, true,
-                             true, true, true, QuantType::kFP4);
+                             true, true, true, false, QuantType::kFP4);
 DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormPerTokenGroupFP8PackedQuant,
-                             false, true, true, true, false, QuantType::kPerTokenGroupFP8Packed);
+                             false, true, true, true, false, false,
+                             QuantType::kPerTokenGroupFP8Packed);
 DEFINE_FUSION_PATTERN_TRAITS(
     AllReduceFusionPattern::kARResidualRMSNormOutPerTokenGroupFP8PackedQuant, false, true, true,
-    true, true, QuantType::kPerTokenGroupFP8Packed);
+    true, true, false, QuantType::kPerTokenGroupFP8Packed);
 DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormDynamicFP8Quant, false, true,
-                             true, true, false, QuantType::kDynamicFP8);
+                             true, true, false, false, QuantType::kDynamicFP8);
 DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormOutDynamicFP8Quant, false,
-                             true, true, true, true, QuantType::kDynamicFP8);
+                             true, true, true, true, false, QuantType::kDynamicFP8);
+DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kResidualRMSNormAR, true, true, true, true,
+                             false, true, QuantType::kNone);
 #undef DEFINE_FUSION_PATTERN_TRAITS
 
 template <AllReduceFusionPattern Pattern>
@@ -893,6 +899,8 @@ template <AllReduceFusionPattern Pattern>
 constexpr bool HasResidualOut = FusionPatternTraits<Pattern>::kHasResidualOut;
 template <AllReduceFusionPattern Pattern>
 constexpr bool HasNormOut = FusionPatternTraits<Pattern>::kHasNormOut;
+template <AllReduceFusionPattern Pattern>
+constexpr bool RMSNormBeforeAllReduce = FusionPatternTraits<Pattern>::kRMSNormBeforeAllReduce;
 template <AllReduceFusionPattern Pattern>
 constexpr QuantType GetQuantType = FusionPatternTraits<Pattern>::kQuantType;
 
@@ -1084,10 +1092,22 @@ class FusedOp {
     }
   }
 
-  // template <typename T, uint32_t VEC_SIZE>
-  __device__ __forceinline__ void operator()(vec_t<T, VEC_SIZE> val, int token_id) {
+  __device__ __forceinline__ vec_t<T, VEC_SIZE> pre_allreduce(vec_t<T, VEC_SIZE> val) {
+    if constexpr (RMSNormBeforeAllReduce<Pattern>) {
+      static_assert(HasResidual<Pattern> && HasResidualOut<Pattern> && HasRMSNorm<Pattern>);
+      val = vec_add<T, VEC_SIZE>(val, m_residual_val);
+      val.store(reinterpret_cast<T*>(m_params.residual_out) + m_access_id * VEC_SIZE);
+      val = rms_norm(val, m_gamma_val);
+    }
+    return val;
+  }
+
+  __device__ __forceinline__ void post_allreduce(vec_t<T, VEC_SIZE> val, int token_id) {
     if constexpr (HasAllReduceOut<Pattern>) {
       val.store(reinterpret_cast<T*>(m_params.allreduce_out) + m_access_id * VEC_SIZE);
+    }
+    if constexpr (RMSNormBeforeAllReduce<Pattern>) {
+      return;
     }
     if constexpr (HasResidual<Pattern>) {
       val = vec_add<T, VEC_SIZE>(val, m_residual_val);
@@ -1519,8 +1539,14 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
   int clear_access = comm.clear_size / VEC_SIZE;
 
   for (int idx = access_id; idx < tot_access; idx += access_stride) {
+    if constexpr (RMSNormBeforeAllReduce<Pattern>) {
+      fused_op.update(idx);
+    }
     vec_t<T, VEC_SIZE> val;
     val.load(reinterpret_cast<T*>(params.allreduce_in) + idx * VEC_SIZE);
+    val = fused_op.pre_allreduce(val);
+    // Lamport uses negative zero as its readiness sentinel. RMSNorm can legitimately produce
+    // negative zero, so sanitize the final local contribution before publishing it.
     remove_neg_zero<T, VEC_SIZE>(val);
 #pragma unroll
     for (int r = 0; r < NRanks; ++r) {
@@ -1551,7 +1577,7 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
       }
     }
     vec_t<T, VEC_SIZE> sum_val = allreduce_sum<T, VEC_SIZE, NRanks, Fp32Acc>(vals);
-    fused_op(sum_val, tidx);
+    fused_op.post_allreduce(sum_val, tidx);
   }
 
   comm.update(params.size * NRanks);
@@ -1585,8 +1611,13 @@ __global__ void allreduce_fusion_kernel_twoshot_sync(AllReduceFusionParams<T> pa
     int comm_access_id = access_id + begin_tokens[r] * params.hidden_dim / VEC_SIZE;
     int comm_tot_access = (begin_tokens[r] + token_num_per_ranks[r]) * params.hidden_dim / VEC_SIZE;
     for (int idx = comm_access_id; idx < comm_tot_access; idx += access_stride) {
-      reinterpret_cast<float4*>(comm.comm_bufs[params.rank])[idx] =
-          reinterpret_cast<float4*>(params.allreduce_in)[idx];
+      if constexpr (RMSNormBeforeAllReduce<Pattern>) {
+        fused_op.update(idx);
+      }
+      vec_t<T, VEC_SIZE> val;
+      val.load(reinterpret_cast<T*>(params.allreduce_in) + idx * VEC_SIZE);
+      val = fused_op.pre_allreduce(val);
+      val.store(reinterpret_cast<T*>(comm.comm_bufs[params.rank]) + idx * VEC_SIZE);
     }
   }
   Barrier<NRanks> barrier(params.rank, comm);
@@ -1618,7 +1649,7 @@ __global__ void allreduce_fusion_kernel_twoshot_sync(AllReduceFusionParams<T> pa
       vec_t<T, VEC_SIZE> sum_val;
       sum_val.load(reinterpret_cast<T*>(comm.comm_bufs[params.rank]) +
                    (tot_access + idx) * VEC_SIZE);
-      fused_op(sum_val, tidx);
+      fused_op.post_allreduce(sum_val, tidx);
     }
   }
   comm.update(barrier.m_flag_value);
@@ -1906,6 +1937,9 @@ cudaError_t allreduce_fusion_op(AllReduceFusionParams<T> const& params, bool lau
       break;                                                                                      \
     case AllReduceFusionPattern::kARResidualRMSNormOutDynamicFP8Quant:                            \
       DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormOutDynamicFP8Quant, NRanks); \
+      break;                                                                                      \
+    case AllReduceFusionPattern::kResidualRMSNormAR:                                              \
+      DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kResidualRMSNormAR, NRanks);                   \
       break;                                                                                      \
     default:                                                                                      \
       FLASHINFER_CHECK(false, "Unsupported allreduce fusion pattern");                            \

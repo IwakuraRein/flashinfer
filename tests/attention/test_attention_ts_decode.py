@@ -1012,6 +1012,7 @@ def _make_mixed_precision_decode_case(
     output_dtype: torch.dtype,
     device: str | torch.device,
     seed: int,
+    mask_type: str = "dense",
 ) -> tuple[_DecodeCase, Optional[tuple[torch.Tensor, torch.Tensor]]]:
     """Build a nonzero mixed-Q/KV case and its independent reference."""
 
@@ -1117,7 +1118,7 @@ def _make_mixed_precision_decode_case(
             bmm2_scale=1.0,
             output_dtype=output_dtype,
             o_scale=1.0,
-            mask_type="dense",
+            mask_type=mask_type,
         )
     else:
         reference = _decode_reference(
@@ -1131,7 +1132,7 @@ def _make_mixed_precision_decode_case(
             q_scale=1.0,
             k_scale=1.0,
             v_scale=1.0,
-            mask_type="dense",
+            mask_type=mask_type,
         )
     reference = reference.to(output_dtype).float()
     return (
@@ -1146,7 +1147,7 @@ def _make_mixed_precision_decode_case(
             paged_kv_last_page_len=last_page_len,
             reference_real=reference,
             output_dtype=output_dtype,
-            mask_type="dense",
+            mask_type=mask_type,
             bmm1_scale=bmm1_scale,
             bmm2_scale=1.0,
             q_scale=1.0,
@@ -4235,6 +4236,78 @@ def test_attention_ts_decode_paged_mixed_matches_o_stages_to_kv_insts(head_dim):
     assert cfg.o_stages == 1
     assert cfg.transform_kv_warp_idx == 4
     assert cfg.transform_kv_num_warps == 4
+
+
+@pytest.mark.parametrize("seq_len_q", (1, 4, 8))
+@pytest.mark.parametrize(
+    "overrides",
+    ({}, {"num_insts_kv": 1}, {"o_stages": 1}, {"transform_kv_warp_idx": 4}),
+)
+def test_attention_ts_decode_nvfp4_p64_grouping(monkeypatch, seq_len_q, overrides):
+    cfg = _make_auto_kv_tile_config(
+        monkeypatch,
+        seq_len_q=seq_len_q,
+        seq_len_kv=262144,
+        batch_size=32,
+        num_heads_q=32,
+        num_heads_kv=2,
+        q_dtype=Float8E4M3FN,
+        k_dtype=Float4E2M1FN,
+        v_dtype=Float4E2M1FN,
+        o_dtype=Float8E4M3FN,
+        num_tokens_per_page=64,
+        mask_type="causal",
+        args=overrides,
+    )
+    assert cfg.q_tokens_per_cta == (1 if seq_len_q == 1 else 2)
+    expected_insts = 2 if seq_len_q > 1 and not overrides else 1
+    assert cfg.num_insts_kv == cfg.o_stages == expected_insts
+    assert cfg.transform_kv_warp_idx == (16 if expected_insts == 2 else 4)
+    assert cfg.transform_kv_num_warps == 4
+    assert cfg.store_transformed_kv_in_tmem
+    assert cfg.tmem_total_cols <= 512
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize("seq_len_q", (4, 8))
+@pytest.mark.parametrize("seq_len_kv", (257, 4096))
+def test_attention_ts_decode_nvfp4_p64_causal(seq_len_q, seq_len_kv):
+    case, scales = _make_mixed_precision_decode_case(
+        batch_size=32,
+        seq_len_kv=seq_len_kv,
+        num_qo_heads=32,
+        num_kv_heads=2,
+        head_dim=128,
+        seq_len_q=seq_len_q,
+        page_size=64,
+        q_dtype=_FP8,
+        kv_dtype=torch.uint8,
+        output_dtype=_FP8,
+        device="cuda",
+        seed=20260924,
+        mask_type="causal",
+    )
+    wrapper = _plan_case(case, max_kv_len=seq_len_kv)
+
+    def run():
+        return wrapper.run(
+            case.q,
+            case.paged_kv_cache,
+            None,
+            case.block_tables,
+            kv_scale_factors=scales,
+            bmm1_scale=case.bmm1_scale,
+            bmm2_scale=case.bmm2_scale,
+            validate=False,
+        )
+
+    _assert_case_correct(run(), case)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = run()
+    graph.replay()
+    _assert_case_correct(output, case)
 
 
 @pytest.mark.parametrize("heads_q_per_kv", (33, 64, 65, 128))

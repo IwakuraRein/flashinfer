@@ -2695,8 +2695,34 @@ def _finalize_static_decode_config(
         _set_if_implicit(cfg, "head_dim_per_stage_kv", 128, explicit_fields)
         _set_if_implicit(cfg, "num_insts_kv", 2, explicit_fields)
     if cfg.use_transform_kv and cfg.use_paged_kv:
-        # Force using 1 instances kv to allow more warps for transform kv tasks.
+        # Default to one KV instance so transform can reuse Softmax1's warps.
         _set_if_implicit(cfg, "num_insts_kv", 1, explicit_fields)
+        if (
+            cfg.use_nvfp4_kv
+            and cfg.use_fp8_q
+            and cfg.headdim == 128
+            and cfg.num_tokens_per_page == 64
+            and cfg.heads_q_per_kv == 16
+            and cfg.max_seq_len_q in (4, 8)
+            and not cfg.use_variable_seqlens_q
+            and cfg.groups_tokens_heads_q
+            and cfg.mask_type == CAUSAL
+            and not cfg.use_sliding_window_causal
+            and not cfg.use_attention_sinks
+            and not explicit_fields.intersection(
+                {
+                    "num_insts_kv",
+                    "o_stages",
+                    "transform_kv_warp_idx",
+                    "transform_kv_num_warps",
+                }
+            )
+        ):
+            # Two softmax instances overlap alternating KV tiles. Keep a full
+            # transform warp group in WG4 instead of sharing Softmax1's WG.
+            _set_if_implicit(cfg, "num_insts_kv", 2, explicit_fields)
+            _set_if_implicit(cfg, "transform_kv_warp_idx", 16, explicit_fields)
+            _set_if_implicit(cfg, "transform_kv_num_warps", 4, explicit_fields)
 
     if use_keeps_mma_ab:
         tile_size_q = cfg.tile_size_q if "tile_size_q" in explicit_fields else 64
@@ -3776,7 +3802,17 @@ def _apply_auto_grouped_q_mma_config(
         or cfg.use_variable_seqlens_q
         or not cfg.groups_tokens_heads_q
         or not cfg.use_paged_kv
-        or cfg.num_tokens_per_page != 32
+        or not (
+            cfg.num_tokens_per_page == 32
+            or (
+                cfg.num_tokens_per_page == 64
+                and cfg.use_nvfp4_kv
+                and cfg.use_fp8_q
+                and cfg.headdim == 128
+                and num_heads_q // num_heads_kv == 16
+                and seq_len_q in (4, 8)
+            )
+        )
         or cfg.mask_type != CAUSAL
         or cfg.use_sliding_window_causal
         or cfg.use_attention_sinks

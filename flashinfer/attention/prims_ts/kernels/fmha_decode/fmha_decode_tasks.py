@@ -779,12 +779,11 @@ class DecodeGenTask(Task):
         context: ResourceContext | None = None,
     ) -> None:
         """Run one ordinary task tile and synchronize attention-sink tails."""
-        Task._run_task_body_impl(
-            self,
-            work_tile,
-            skip_work_tile,
-            context=context,
-        )
+        # CUTLASS 4.8 removes the context argument; 4.7 still passes it here.
+        if cutlass.const_expr(context is None):
+            Task._run_task_body_impl(self, work_tile, skip_work_tile)
+        else:
+            Task._run_task_body_impl(self, work_tile, skip_work_tile, context=context)
         if cutlass.const_expr(
             self.cfg is not None
             and self.cfg.use_persistent_scheduler
@@ -823,7 +822,10 @@ class DecodeGenTask(Task):
             and self._has_skip_if
         )
         if cutlass.const_expr(not use_packed_early_stop):
-            Task._run_task_body_persistent(self, context)
+            if cutlass.const_expr(context is None):
+                Task._run_task_body_persistent(self)
+            else:
+                Task._run_task_body_persistent(self, context)
             return
 
         assert self.work_queue is not None
@@ -853,7 +855,10 @@ class DecodeGenTask(Task):
             # The tile is known active here. Running the complete schedule
             # without a dynamic skip guard keeps HEAD-produced pipeline state
             # in scope for LOOP and TAIL.
-            Task._run_task_body_impl(self, work_tile, None, context=context)
+            if cutlass.const_expr(context is None):
+                Task._run_task_body_impl(self, work_tile, None)
+            else:
+                Task._run_task_body_impl(self, work_tile, None, context=context)
             if cutlass.const_expr(self.cfg.use_attention_sinks):
                 prims.barrier_cta_sync(12, thread_count=16 * 32)
             work_tile = self.work_queue._get_consumer_var_from_ts("work_tile")

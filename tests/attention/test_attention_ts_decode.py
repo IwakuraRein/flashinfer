@@ -4276,6 +4276,69 @@ def test_attention_ts_decode_nvfp4_p64_grouping(
         assert cfg.softmax_task_num_registers == (112 if tuned_registers else 72)
 
 
+@pytest.mark.parametrize("seq_len_q", (1, 2, 4, 8))
+@pytest.mark.parametrize("native_conversion", (False, True))
+@pytest.mark.parametrize("split_kv", (False, True))
+@pytest.mark.parametrize("max_kv_len", (257, 512, 513, 1048576))
+def test_attention_ts_decode_nvfp4_p64_keeps_launch(
+    monkeypatch, seq_len_q, native_conversion, split_kv, max_kv_len
+):
+    from contextlib import nullcontext
+
+    monkeypatch.setattr(cutlass, "target_version", lambda **kwargs: native_conversion)
+
+    class _B200Hardware:
+        def get_device_multiprocessor_count(self) -> int:
+            return 148
+
+    monkeypatch.setattr(fmha_decode_config.utils, "HardwareInfo", _B200Hardware)
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "get_max_active_clusters_for_cluster_size",
+        lambda cluster_size: 148 // cluster_size,
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda *_args: nullcontext())
+    _resolve_decode_launch_spec.cache_clear()
+    try:
+        cfg = _resolve_decode_launch_spec(
+            0,
+            32,
+            32,
+            2,
+            128,
+            64,
+            max_kv_len,
+            seq_len_q,
+            "float8_e4m3fn",
+            "float4_e2m1fn",
+            "float4_e2m1fn",
+            "float8_e4m3fn",
+            "HND",
+            "causal",
+            False,
+            -1,
+            split_kv=split_kv,
+        ).config
+    finally:
+        _resolve_decode_launch_spec.cache_clear()
+
+    expected_keeps = (
+        seq_len_q == 4 and native_conversion and split_kv and max_kv_len > 512
+    )
+    assert cfg.is_nvfp4_keeps_q64_block16 is expected_keeps
+    assert cfg.use_keeps_mma_ab is expected_keeps
+    assert cfg.store_transformed_kv_in_tmem is not expected_keeps
+    if expected_keeps:
+        assert cfg.q_tokens_per_cta == 4
+        assert (
+            cfg.num_insts_kv == cfg.o_stages == cfg.splits_kv == cfg.max_splits_kv == 2
+        )
+        assert not cfg.use_persistent_scheduler
+        assert not cfg.use_separate_reduction_kernel
+    if not split_kv:
+        assert not cfg.use_split_kv
+
+
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.parametrize("seq_len_q", (2, 4, 8))

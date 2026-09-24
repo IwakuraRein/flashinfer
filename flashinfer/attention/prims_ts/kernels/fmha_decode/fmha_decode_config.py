@@ -2382,8 +2382,47 @@ class FmhaDecodeConfig:
             )
 
     @property
+    def is_nvfp4_keeps_q64_block16(self) -> bool:
+        """Recognize fixed-Q4 mixed-precision Keeps with block16 conversion."""
+        return (
+            self.use_keeps_mma_ab
+            and self.groups_tokens_heads_q
+            and self.use_paged_kv
+            and self.num_tokens_per_page == 64
+            and self.effective_storage_tokens_per_page == 64
+            and self.q_dtype == self.out_dtype == Float8E4M3FN
+            and self.use_nvfp4_kv
+            and self.headdim == 128
+            and self.head_dim_per_stage_kv == 0
+            and self.heads_q_per_kv == 16
+            and self.max_seq_len_q == 4
+            and self.tile_size_q == 64
+            and self.tile_size_kv == 128
+            and self.num_insts_kv == self.o_stages == 2
+            and self.transform_kv_num_warps == 4
+            and self.use_split_kv
+            and self.splits_kv == self.max_splits_kv == 2
+            and not self.store_transformed_kv_in_tmem
+            and not self.use_variable_seqlens_q
+            and self.mask_type == CAUSAL
+            and not any(
+                (
+                    self.use_persistent_scheduler,
+                    self.use_pdl,
+                    self.use_separate_reduction_kernel,
+                    self.use_cluster_smem_reduction,
+                    self.use_sliding_window_causal,
+                    self.use_attention_sinks,
+                    self.use_block_sparse,
+                )
+            )
+        )
+
+    @property
     def supports_grouped_keeps(self) -> bool:
         """Whether a validated config uses a qualified grouped-Keeps recipe."""
+        if self.is_nvfp4_keeps_q64_block16:
+            return True
         if self.tile_size_kv == 256:
             # KV256 reuses the common fixed/packed-Q, page-table, masking,
             # persistent scheduler, attention-sink, and GMEM split-publisher
@@ -4474,7 +4513,7 @@ def _validate_profile_support(
             "and a four-warp TransformKvTask"
         )
     if use_keeps_mma_ab:
-        if cfg.use_transform_kv:
+        if cfg.use_transform_kv and not cfg.is_nvfp4_keeps_q64_block16:
             raise ValueError("transform-KV is not supported with KeepsMmaAb for now")
         if headdim not in (64, 128, 256):
             raise ValueError("fmha_decode keepsMmaAb supports headdim=64, 128, or 256")

@@ -1284,6 +1284,26 @@ def _resolve_decode_launch_spec(
     k_dtype = dtype_map[k_dtype_key]
     v_dtype = dtype_map[v_dtype_key]
     output_dtype = dtype_map[output_dtype_key]
+    # Q64 reuses converted KV across all four query tokens. Two KV splits
+    # recover parallelism without loading the full context for each Q32 tile.
+    use_nvfp4_keeps_q64_block16 = (
+        seq_len_q == 4
+        and head_dim == 128
+        and num_qo_heads == 32
+        and num_kv_heads == 2
+        and page_size == storage_page_size == 64
+        and q_dtype_key == output_dtype_key == "float8_e4m3fn"
+        and k_dtype_key == v_dtype_key == "float4_e2m1fn"
+        and mask_type == "causal"
+        and window_left < 0
+        and not use_packed_q
+        and not use_q_token_kv_block_sparse_route
+        and not use_pdl
+        and split_kv
+        # Below this bound the split policy collapses the two splits to one.
+        and max_kv_len > 128 * 2 * MIN_LOOP_ITERS_PER_SPLIT
+        and cutlass.target_version(min_version="13.4")
+    )
 
     def make_config(
         args: object | None = None,
@@ -1293,6 +1313,9 @@ def _resolve_decode_launch_spec(
         max_splits_kv: int | None = None,
         min_loop_iters_per_split: int = MIN_LOOP_ITERS_PER_SPLIT,
     ) -> "FmhaDecodeConfig":
+        if use_nvfp4_keeps_q64_block16:
+            split_kv_mode = "gmem_reduction"
+            splits_kv = max_splits_kv = 2
         return make_decode_config(
             headdim=head_dim,
             args=args,
@@ -1315,7 +1338,7 @@ def _resolve_decode_launch_spec(
             mask_type=mask_type,
             sliding_window_causal=window_left >= 0,
             attention_window_size=window_left + 1 if window_left >= 0 else 0,
-            auto_tuner=True,
+            auto_tuner=not use_nvfp4_keeps_q64_block16,
             split_kv=split_kv,
         )
 
@@ -1366,7 +1389,23 @@ def _resolve_decode_launch_spec(
                 share_pattern_across_kv_heads=share_pattern_across_kv_heads,
             )
         else:
-            config_overrides = {"use_pdl": use_pdl}
+            config_overrides: dict[str, bool | int] = {"use_pdl": use_pdl}
+            if use_nvfp4_keeps_q64_block16:
+                config_overrides.update(
+                    use_keeps_mma_ab=True,
+                    groups_tokens_heads_q=True,
+                    tile_size_q=64,
+                    tile_size_kv=128,
+                    num_insts_kv=2,
+                    o_stages=2,
+                    store_transformed_kv_in_tmem=False,
+                    transform_kv_warp_idx=16,
+                    transform_kv_num_warps=4,
+                    use_persistent_scheduler=False,
+                    use_split_kv=True,
+                    use_cluster_smem_reduction=False,
+                    use_separate_reduction_kernel=False,
+                )
             if use_packed_q:
                 config_overrides["use_variable_seqlens_q"] = True
             cfg = make_config(config_overrides)

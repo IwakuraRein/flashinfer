@@ -4238,12 +4238,16 @@ def test_attention_ts_decode_paged_mixed_matches_o_stages_to_kv_insts(head_dim):
     assert cfg.transform_kv_num_warps == 4
 
 
-@pytest.mark.parametrize("seq_len_q", (1, 4, 8))
+@pytest.mark.parametrize("seq_len_q", (1, 2, 4, 8))
+@pytest.mark.parametrize("native_conversion", (False, True))
 @pytest.mark.parametrize(
     "overrides",
     ({}, {"num_insts_kv": 1}, {"o_stages": 1}, {"transform_kv_warp_idx": 4}),
 )
-def test_attention_ts_decode_nvfp4_p64_grouping(monkeypatch, seq_len_q, overrides):
+def test_attention_ts_decode_nvfp4_p64_grouping(
+    monkeypatch, seq_len_q, native_conversion, overrides
+):
+    monkeypatch.setattr(cutlass, "target_version", lambda **kwargs: native_conversion)
     cfg = _make_auto_kv_tile_config(
         monkeypatch,
         seq_len_q=seq_len_q,
@@ -4266,11 +4270,15 @@ def test_attention_ts_decode_nvfp4_p64_grouping(monkeypatch, seq_len_q, override
     assert cfg.transform_kv_num_warps == 4
     assert cfg.store_transformed_kv_in_tmem
     assert cfg.tmem_total_cols <= 512
+    tuned_registers = native_conversion and seq_len_q in (2, 4) and expected_insts == 2
+    assert cfg.transform_kv_task_num_registers == (112 if tuned_registers else 184)
+    if expected_insts == 2:
+        assert cfg.softmax_task_num_registers == (112 if tuned_registers else 72)
 
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.parametrize("seq_len_q", (4, 8))
+@pytest.mark.parametrize("seq_len_q", (2, 4, 8))
 @pytest.mark.parametrize("seq_len_kv", (257, 4096))
 def test_attention_ts_decode_nvfp4_p64_causal(seq_len_q, seq_len_kv):
     case, scales = _make_mixed_precision_decode_case(

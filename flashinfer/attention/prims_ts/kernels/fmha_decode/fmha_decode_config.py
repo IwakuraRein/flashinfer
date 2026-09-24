@@ -24,6 +24,7 @@ from copy import deepcopy
 from dataclasses import dataclass, fields, replace
 from functools import wraps
 
+import cutlass
 import cutlass.utils as utils
 from cutlass import BFloat16, Float16, Float32, Float4E2M1FN, Float8E4M3FN
 
@@ -879,6 +880,21 @@ class FmhaDecodeConfig:
     def transform_kv_task_num_registers(self) -> int | None:
         if not self.use_transform_kv:
             return None
+        if (
+            self.store_transformed_kv_in_tmem
+            and self.num_insts_kv == 2
+            and self.use_nvfp4_kv
+            and self.use_fp8_q
+            and self.use_paged_kv
+            and self.num_tokens_per_page == 64
+            and self.headdim == 128
+            and self.heads_q_per_kv == 16
+            and self.max_seq_len_q in (2, 4)
+            and cutlass.target_version(min_version="13.4")
+        ):
+            # Native FP4 conversion needs fewer registers, leaving more of
+            # the CTA register pool for both softmax instances.
+            return 112
         if self.num_insts_kv == 1 or self.store_transformed_kv_in_tmem:
             return 184
         if self.headdim == 64:
@@ -2703,7 +2719,7 @@ def _finalize_static_decode_config(
             and cfg.headdim == 128
             and cfg.num_tokens_per_page == 64
             and cfg.heads_q_per_kv == 16
-            and cfg.max_seq_len_q in (4, 8)
+            and cfg.max_seq_len_q in (2, 4, 8)
             and not cfg.use_variable_seqlens_q
             and cfg.groups_tokens_heads_q
             and cfg.mask_type == CAUSAL
@@ -3810,7 +3826,7 @@ def _apply_auto_grouped_q_mma_config(
                 and cfg.use_fp8_q
                 and cfg.headdim == 128
                 and num_heads_q // num_heads_kv == 16
-                and seq_len_q in (4, 8)
+                and seq_len_q in (2, 4, 8)
             )
         )
         or cfg.mask_type != CAUSAL

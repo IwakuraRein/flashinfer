@@ -515,7 +515,7 @@ class SmemTransformedKvResource(DecodeGenResourceBase):
         total_elems = cfg.tile_size_kv * cfg.head_dim_kv_stage
         num_threads = cfg.transform_kv_num_warps * 32
         if cutlass.const_expr(
-            cfg.is_nvfp4_keeps_q64_block16
+            (cfg.is_nvfp4_keeps_q64_block16 or cfg.is_nvfp4_keeps_q128_block16)
             and cutlass.target_version(min_version="13.4")
         ):
             for e in cutlass.range(total_elems // (num_threads * 16), unroll=8):

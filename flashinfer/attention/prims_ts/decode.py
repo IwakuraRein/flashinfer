@@ -1284,10 +1284,10 @@ def _resolve_decode_launch_spec(
     k_dtype = dtype_map[k_dtype_key]
     v_dtype = dtype_map[v_dtype_key]
     output_dtype = dtype_map[output_dtype_key]
-    # Q64 reuses converted KV across all four query tokens. Two KV splits
-    # recover parallelism without loading the full context for each Q32 tile.
-    use_nvfp4_keeps_q64_block16 = (
-        seq_len_q == 4
+    # Q64/Q128 reuse converted KV across all four/eight query tokens.
+    # Split KV recovers parallelism without repeating KV loads per Q32 tile.
+    use_nvfp4_keeps_block16 = (
+        seq_len_q in (4, 8)
         and head_dim == 128
         and num_qo_heads == 32
         and num_kv_heads == 2
@@ -1313,9 +1313,15 @@ def _resolve_decode_launch_spec(
         max_splits_kv: int | None = None,
         min_loop_iters_per_split: int = MIN_LOOP_ITERS_PER_SPLIT,
     ) -> "FmhaDecodeConfig":
-        if use_nvfp4_keeps_q64_block16:
+        if use_nvfp4_keeps_block16:
             split_kv_mode = "gmem_reduction"
-            splits_kv = max_splits_kv = 2
+            # Keep a supported fanout when short capacities cap four splits at three.
+            splits_kv = max_splits_kv = (
+                4
+                if batch_size <= 64
+                and max_kv_len > 3 * 128 * 2 * MIN_LOOP_ITERS_PER_SPLIT
+                else 2
+            )
         return make_decode_config(
             headdim=head_dim,
             args=args,
@@ -1338,7 +1344,7 @@ def _resolve_decode_launch_spec(
             mask_type=mask_type,
             sliding_window_causal=window_left >= 0,
             attention_window_size=window_left + 1 if window_left >= 0 else 0,
-            auto_tuner=not use_nvfp4_keeps_q64_block16,
+            auto_tuner=not use_nvfp4_keeps_block16,
             split_kv=split_kv,
         )
 
@@ -1390,11 +1396,11 @@ def _resolve_decode_launch_spec(
             )
         else:
             config_overrides: dict[str, bool | int] = {"use_pdl": use_pdl}
-            if use_nvfp4_keeps_q64_block16:
+            if use_nvfp4_keeps_block16:
                 config_overrides.update(
                     use_keeps_mma_ab=True,
                     groups_tokens_heads_q=True,
-                    tile_size_q=64,
+                    tile_size_q=64 if seq_len_q == 4 else 128,
                     tile_size_kv=128,
                     num_insts_kv=2,
                     o_stages=2,
@@ -1405,7 +1411,11 @@ def _resolve_decode_launch_spec(
                     use_split_kv=True,
                     use_cluster_smem_reduction=False,
                     use_separate_reduction_kernel=False,
+                    kv_stages=12,
+                    transformed_kv_stages=4,
                 )
+                if seq_len_q == 8 and batch_size >= 128:
+                    config_overrides["ordered_softmax_barrier_mode"] = 0
             if use_packed_q:
                 config_overrides["use_variable_seqlens_q"] = True
             cfg = make_config(config_overrides)

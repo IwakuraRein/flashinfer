@@ -2686,7 +2686,7 @@ def create_transform_kv_task(
     """Create the K/V transform task.
 
     Consume one shared ``smem_kv``, or the four split `smem_k0/k1/v0/v1`
-    and publish the same ordered K0/V0/K1/V1 stream into ``smem_transformed_kv``.
+    and publish the stream into ``smem_transformed_kv`` in MMA consumption order.
     """
     head_labels = (
         ("transform_k0",) if cfg.num_insts_kv == 1 else ("transform_k0", "transform_k1")
@@ -2696,6 +2696,12 @@ def create_transform_kv_task(
         if cfg.num_insts_kv == 1
         else ("transform_k0", "transform_v0", "transform_k1", "transform_v1")
     )
+    if (
+        cfg.is_nvfp4_keeps_q64_block16 or cfg.is_nvfp4_keeps_q128_block16
+    ) and cfg.uses_two_inst_tmem_p:
+        # The aliased P must be consumed before QK overwrites the same S
+        # region. Match create_mma_task's V-before-K transformed FIFO order.
+        loop_labels = ("transform_v0", "transform_k0", "transform_v1", "transform_k1")
     tail_labels = (
         ("transform_v0",) if cfg.num_insts_kv == 1 else ("transform_v0", "transform_v1")
     )

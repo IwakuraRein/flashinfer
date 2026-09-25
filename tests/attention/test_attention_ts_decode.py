@@ -4279,9 +4279,10 @@ def test_attention_ts_decode_nvfp4_p64_grouping(
 @pytest.mark.parametrize("seq_len_q", (1, 2, 4, 8))
 @pytest.mark.parametrize("native_conversion", (False, True))
 @pytest.mark.parametrize("split_kv", (False, True))
-@pytest.mark.parametrize("max_kv_len", (257, 512, 513, 1048576))
+@pytest.mark.parametrize("batch_size", (32, 64, 65, 127, 128, 129, 256))
+@pytest.mark.parametrize("max_kv_len", (257, 512, 513, 1024, 1025, 1536, 1537, 1048576))
 def test_attention_ts_decode_nvfp4_p64_keeps_launch(
-    monkeypatch, seq_len_q, native_conversion, split_kv, max_kv_len
+    monkeypatch, seq_len_q, native_conversion, split_kv, batch_size, max_kv_len
 ):
     from contextlib import nullcontext
 
@@ -4302,7 +4303,7 @@ def test_attention_ts_decode_nvfp4_p64_keeps_launch(
     try:
         cfg = _resolve_decode_launch_spec(
             0,
-            32,
+            batch_size,
             32,
             2,
             128,
@@ -4323,15 +4324,35 @@ def test_attention_ts_decode_nvfp4_p64_keeps_launch(
         _resolve_decode_launch_spec.cache_clear()
 
     expected_keeps = (
-        seq_len_q == 4 and native_conversion and split_kv and max_kv_len > 512
+        seq_len_q in (4, 8) and native_conversion and split_kv and max_kv_len > 512
     )
-    assert cfg.is_nvfp4_keeps_q64_block16 is expected_keeps
+    assert cfg.is_nvfp4_keeps_q64_block16 is (expected_keeps and seq_len_q == 4)
+    assert cfg.is_nvfp4_keeps_q128_block16 is (expected_keeps and seq_len_q == 8)
     assert cfg.use_keeps_mma_ab is expected_keeps
     assert cfg.store_transformed_kv_in_tmem is not expected_keeps
     if expected_keeps:
-        assert cfg.q_tokens_per_cta == 4
+        assert cfg.q_tokens_per_cta == seq_len_q
+        assert cfg.tile_size_q == 16 * seq_len_q
+        assert cfg.q_dtype == cfg.out_dtype == Float8E4M3FN
+        assert cfg.use_nvfp4_kv
+        assert cfg.num_insts_kv == cfg.o_stages == 2
+        # Four splits would otherwise be capped to the unsupported fanout three.
+        expected_splits = 4 if batch_size <= 64 and max_kv_len > 1536 else 2
+        assert cfg.splits_kv == cfg.max_splits_kv == expected_splits
+        assert cfg.kv_stages == 12
+        assert cfg.transformed_kv_stages == 4
+        assert cfg.uses_two_inst_tmem_p
+        assert cfg.tmem_p_cols_per_inst == 32
+        assert cfg.tmem_total_cols <= 512
+        expected_registers = (176, 40, 32, 56) if seq_len_q == 8 else (136, 88, 56, 56)
         assert (
-            cfg.num_insts_kv == cfg.o_stages == cfg.splits_kv == cfg.max_splits_kv == 2
+            cfg.softmax_task_num_registers,
+            cfg.correction_task_num_registers,
+            cfg.mma_load_task_num_registers,
+            cfg.transform_kv_task_num_registers,
+        ) == expected_registers
+        assert cfg.uses_ordered_softmax_barrier is not (
+            seq_len_q == 8 and batch_size >= 128
         )
         assert not cfg.use_persistent_scheduler
         assert not cfg.use_separate_reduction_kernel
@@ -4343,9 +4364,10 @@ def test_attention_ts_decode_nvfp4_p64_keeps_launch(
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.parametrize("seq_len_q", (2, 4, 8))
 @pytest.mark.parametrize("seq_len_kv", (257, 4096))
-def test_attention_ts_decode_nvfp4_p64_causal(seq_len_q, seq_len_kv):
+@pytest.mark.parametrize("batch_size", (32, 128))
+def test_attention_ts_decode_nvfp4_p64_causal(seq_len_q, seq_len_kv, batch_size):
     case, scales = _make_mixed_precision_decode_case(
-        batch_size=32,
+        batch_size=batch_size,
         seq_len_kv=seq_len_kv,
         num_qo_heads=32,
         num_kv_heads=2,

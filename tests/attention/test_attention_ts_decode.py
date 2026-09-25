@@ -4411,6 +4411,142 @@ def test_attention_ts_decode_nvfp4_p64_causal(seq_len_q, seq_len_kv, batch_size)
     _assert_case_correct(output, case)
 
 
+@pytest.mark.parametrize("seq_len_q", (2, 4, 8))
+@pytest.mark.parametrize("batch_size", (16, 32, 64, 128, 256, 512))
+@pytest.mark.parametrize("max_kv_len", (2051, 32768))
+@pytest.mark.parametrize("partial_p", (False, True))
+def test_attention_ts_decode_fp8_p64_launch(
+    monkeypatch, seq_len_q, batch_size, max_kv_len, partial_p
+):
+    from contextlib import nullcontext
+
+    monkeypatch.setattr(cutlass, "target_version", lambda **kwargs: partial_p)
+
+    class _B200Hardware:
+        def get_device_multiprocessor_count(self) -> int:
+            return 148
+
+    monkeypatch.setattr(fmha_decode_config.utils, "HardwareInfo", _B200Hardware)
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "get_max_active_clusters_for_cluster_size",
+        lambda cluster_size: 148 // cluster_size,
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda *_args: nullcontext())
+    _resolve_decode_launch_spec.cache_clear()
+    try:
+        cfg = _resolve_decode_launch_spec(
+            0,
+            batch_size,
+            32,
+            2,
+            128,
+            64,
+            max_kv_len,
+            seq_len_q,
+            "float8_e4m3fn",
+            "float8_e4m3fn",
+            "float8_e4m3fn",
+            "float8_e4m3fn",
+            "HND",
+            "causal",
+            False,
+            -1,
+        ).config
+    finally:
+        _resolve_decode_launch_spec.cache_clear()
+
+    tuned_domain = 32 <= batch_size <= 256 and max_kv_len >= 32768
+    expected_keeps = tuned_domain and seq_len_q >= 4
+    assert cfg.use_keeps_mma_ab is expected_keeps
+    assert cfg.tile_size_q == (16 * seq_len_q if tuned_domain else 16)
+    assert cfg.publishes_partial_fp8_p is (
+        expected_keeps and seq_len_q == 4 and partial_p
+    )
+    if expected_keeps:
+        assert cfg.uses_two_inst_tmem_p is (seq_len_q == 8 or partial_p)
+        if cfg.uses_two_inst_tmem_p:
+            assert cfg.tmem_p_cols_per_inst == 32
+        assert cfg.tmem_total_cols <= 512
+    if tuned_domain:
+        if seq_len_q == 2 and batch_size <= 64:
+            assert cfg.use_cluster_smem_reduction is (batch_size == 32)
+            assert cfg.splits_kv == (2 if batch_size == 32 else 1)
+        else:
+            assert cfg.splits_kv == cfg.max_splits_kv == (8 if batch_size <= 64 else 4)
+            assert not cfg.use_cluster_smem_reduction
+            assert not cfg.use_separate_reduction_kernel
+            assert not cfg.use_persistent_scheduler
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize("seq_len_q", (2, 4, 8))
+@pytest.mark.parametrize("batch_size", (33, 129))
+@pytest.mark.parametrize("max_kv_len", (2051, 1048576))
+def test_attention_ts_decode_fp8_p64_grouped_causal(seq_len_q, batch_size, max_kv_len):
+    lengths = (seq_len_q, 63, 65, 257, 2051)
+    case = _make_decode_case(
+        kv_lens=tuple(lengths[b % len(lengths)] for b in range(batch_size)),
+        num_qo_heads=32,
+        num_kv_heads=2,
+        head_dim=128,
+        seq_len_q=seq_len_q,
+        page_size=64,
+        qkv_dtype=_FP8,
+        output_dtype=_FP8,
+        cache_form="tuple",
+        mask_type="causal",
+        device="cuda",
+        seed=20260925,
+    )
+    wrapper = _plan_case(case, max_kv_len=max_kv_len)
+    reference = _decode_reference(
+        case.q,
+        case.k_cache,
+        case.v_cache,
+        case.paged_kv_indptr,
+        case.paged_kv_indices,
+        case.paged_kv_last_page_len,
+        sm_scale=1 / math.sqrt(128),
+        q_scale=case.q_scale,
+        k_scale=case.k_scale,
+        v_scale=case.v_scale,
+        mask_type="causal",
+    )
+
+    def assert_correct(output):
+        # The elementwise FP8-P oracle rejects one-ULP differences even on
+        # stock PrimTS. Bound FP32-relative L2 error to 10% per query token,
+        # with an absolute floor of 2**-9 for outputs near zero.
+        actual = output.float() * case.o_scale
+        assert output.shape == case.q.shape and output.dtype == _FP8
+        assert torch.isfinite(actual).all()
+        delta = (actual - reference).flatten(2)
+        relative = delta.norm(dim=-1) / reference.flatten(2).norm(dim=-1).clamp_min(
+            1e-12
+        )
+        assert ((relative <= 0.1) | (delta.abs().amax(dim=-1) <= 2**-9)).all()
+
+    def run():
+        return wrapper.run(
+            case.q,
+            case.paged_kv_cache,
+            None,
+            case.block_tables,
+            bmm1_scale=case.bmm1_scale,
+            bmm2_scale=case.bmm2_scale,
+            validate=False,
+        )
+
+    assert_correct(run())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = run()
+    graph.replay()
+    assert_correct(output)
+
+
 @pytest.mark.parametrize("heads_q_per_kv", (33, 64, 65, 128))
 @pytest.mark.parametrize(
     ("q_dtype", "kv_dtype", "output_dtype"),

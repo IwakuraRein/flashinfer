@@ -1305,6 +1305,28 @@ def _resolve_decode_launch_spec(
         and cutlass.target_version(min_version="13.4")
     )
 
+    use_fp8_grouped_p64 = (
+        seq_len_q in (2, 4, 8)
+        and (seq_len_q != 2 or batch_size >= 128)
+        and 32 <= batch_size <= 256
+        and head_dim == 128
+        and num_qo_heads == 32
+        and num_kv_heads == 2
+        and page_size == storage_page_size == 64
+        and q_dtype_key
+        == k_dtype_key
+        == v_dtype_key
+        == output_dtype_key
+        == "float8_e4m3fn"
+        and mask_type == "causal"
+        and window_left < 0
+        and not use_packed_q
+        and not use_q_token_kv_block_sparse_route
+        and not use_pdl
+        and split_kv
+        and max_kv_len >= 32768
+    )
+
     def make_config(
         args: object | None = None,
         *,
@@ -1329,6 +1351,11 @@ def _resolve_decode_launch_spec(
                 and max_kv_len > 6 * 128 * 2 * MIN_LOOP_ITERS_PER_SPLIT
             ):
                 splits_kv = max_splits_kv = 7
+        if use_fp8_grouped_p64:
+            # Split the context to balance ragged request tails without
+            # repeating KV loads for additional query-token groups.
+            split_kv_mode = "gmem_reduction"
+            splits_kv = max_splits_kv = 8 if batch_size <= 64 else 4
         return make_decode_config(
             headdim=head_dim,
             args=args,
@@ -1351,7 +1378,7 @@ def _resolve_decode_launch_spec(
             mask_type=mask_type,
             sliding_window_causal=window_left >= 0,
             attention_window_size=window_left + 1 if window_left >= 0 else 0,
-            auto_tuner=not use_nvfp4_keeps_block16,
+            auto_tuner=not (use_nvfp4_keeps_block16 or use_fp8_grouped_p64),
             split_kv=split_kv,
         )
 
@@ -1423,6 +1450,16 @@ def _resolve_decode_launch_spec(
                 )
                 if seq_len_q == 8 and batch_size >= 128:
                     config_overrides["ordered_softmax_barrier_mode"] = 0
+            if use_fp8_grouped_p64:
+                config_overrides.update(
+                    use_keeps_mma_ab=seq_len_q >= 4,
+                    groups_tokens_heads_q=True,
+                    tile_size_q=16 * seq_len_q,
+                    use_persistent_scheduler=False,
+                    use_split_kv=True,
+                    use_cluster_smem_reduction=False,
+                    use_separate_reduction_kernel=False,
+                )
             if use_packed_q:
                 config_overrides["use_variable_seqlens_q"] = True
             cfg = make_config(config_overrides)

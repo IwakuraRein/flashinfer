@@ -1560,7 +1560,7 @@ class FmhaDecodeConfig:
         columns per instance.
         """
         if self.uses_two_inst_tmem_p:
-            if self.is_nvfp4_keeps_q64_block16:
+            if self.tile_size_q == 64 and self.tile_size_kv == 128:
                 # Q64 uses 16x32bx2: the two half-warps own separate packed
                 # rows, spaced by num_packed_p_regs in the TMEM columns.
                 return 2 * self.num_packed_p_regs
@@ -2126,7 +2126,7 @@ class FmhaDecodeConfig:
         packed-P row per pipeline token. Q64/KV256 and block-sparse 16-bit
         Q128/KV128 use the same S-to-P aliasing contract but stream four
         independently ready K32 fragments (see ``streams_tmem_p_fragments``).
-        Q64/KV128 retains SMEM P except for the fixed-Q4 NVFP4 path.
+        Q64/KV128 retains SMEM P except for fixed-Q4 P64 FP8/NVFP4.
         """
         # Two-instance Keeps keeps stats outside S, so both static and persistent
         # work tiles can overlay P on the consumed S instance. The split K/V
@@ -2138,6 +2138,33 @@ class FmhaDecodeConfig:
                 (self.tile_size_q == 128 and self.tile_size_kv == 128)
                 or (self.tile_size_q == 64 and self.tile_size_kv == 256)
                 or self.is_nvfp4_keeps_q64_block16
+                or (
+                    self.tile_size_q == 64
+                    and self.tile_size_kv == 128
+                    and self.headdim == 128
+                    and self.use_fp8_q
+                    and self.out_dtype == Float8E4M3FN
+                    and not self.use_transform_kv
+                    and not self.use_block_sparse
+                    and not self.use_sliding_window_causal
+                    and not self.use_attention_sinks
+                    and self.use_paged_kv
+                    and self.num_tokens_per_page == 64
+                    and self.effective_storage_tokens_per_page == 64
+                    and self.use_split_kv
+                    and self.splits_kv == self.max_splits_kv
+                    and self.splits_kv in (4, 8)
+                    and not self.use_persistent_scheduler
+                    and not self.use_pdl
+                    and not self.use_separate_reduction_kernel
+                    and not self.use_cluster_smem_reduction
+                    and cutlass.target_version(min_version="13.4")
+                    and self.heads_q_per_kv == 16
+                    and self.max_seq_len_q == 4
+                    and self.groups_tokens_heads_q
+                    and not self.use_variable_seqlens_q
+                    and self.mask_type == CAUSAL
+                )
             )
             and self.head_dim_per_stage_kv == 0
             and self.num_insts_kv == 2
@@ -2148,8 +2175,12 @@ class FmhaDecodeConfig:
     @property
     def publishes_partial_fp8_p(self) -> bool:
         """Publish fixed-Q4 FP8 probabilities in two independently ready parts."""
-        return self.is_nvfp4_keeps_q64_block16 and cutlass.target_version(
-            min_version="13.4"
+        return (
+            self.uses_two_inst_tmem_p
+            and self.tile_size_q == 64
+            and self.tile_size_kv == 128
+            and self.use_fp8_q
+            and cutlass.target_version(min_version="13.4")
         )
 
     @property
@@ -2552,7 +2583,23 @@ class FmhaDecodeConfig:
                 (fixed_q1 or fixed_grouped_q)
                 and not self.use_variable_seqlens_q
                 and self.use_paged_kv
-                and self.num_tokens_per_page == 32
+                and (
+                    self.num_tokens_per_page == 32
+                    or (
+                        self.num_tokens_per_page == 64
+                        and self.effective_storage_tokens_per_page == 64
+                        and self.headdim == 128
+                        and self.heads_q_per_kv == 16
+                        and self.max_seq_len_q in (4, 8)
+                        and self.mask_type == CAUSAL
+                        and self.use_split_kv
+                        and self.splits_kv == self.max_splits_kv
+                        and self.splits_kv in (4, 8)
+                        and not self.use_persistent_scheduler
+                        and not self.use_pdl
+                        and not self.use_separate_reduction_kernel
+                    )
+                )
                 and self.mask_type in (DENSE, CAUSAL)
                 and not any(
                     (
@@ -3933,7 +3980,16 @@ def _apply_auto_grouped_q_mma_config(
             cfg.num_tokens_per_page == 32
             or (
                 cfg.num_tokens_per_page == 64
-                and cfg.use_nvfp4_kv
+                and (
+                    cfg.use_nvfp4_kv
+                    or (
+                        cfg.q_dtype == cfg.k_dtype == cfg.v_dtype == cfg.out_dtype
+                        and num_heads_q == 32
+                        and num_heads_kv == 2
+                        and 32 <= batch_size <= 256
+                        and seq_len_kv >= 32768
+                    )
+                )
                 and cfg.use_fp8_q
                 and cfg.headdim == 128
                 and num_heads_q // num_heads_kv == 16

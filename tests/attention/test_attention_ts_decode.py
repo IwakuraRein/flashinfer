@@ -4280,7 +4280,9 @@ def test_attention_ts_decode_nvfp4_p64_grouping(
 @pytest.mark.parametrize("native_conversion", (False, True))
 @pytest.mark.parametrize("split_kv", (False, True))
 @pytest.mark.parametrize("batch_size", (32, 64, 65, 127, 128, 129, 256))
-@pytest.mark.parametrize("max_kv_len", (257, 512, 513, 1024, 1025, 1536, 1537, 1048576))
+@pytest.mark.parametrize(
+    "max_kv_len", (257, 512, 513, 1024, 1025, 1536, 1537, 3072, 3073, 1048576)
+)
 def test_attention_ts_decode_nvfp4_p64_keeps_launch(
     monkeypatch, seq_len_q, native_conversion, split_kv, batch_size, max_kv_len
 ):
@@ -4328,6 +4330,10 @@ def test_attention_ts_decode_nvfp4_p64_keeps_launch(
     )
     assert cfg.is_nvfp4_keeps_q64_block16 is (expected_keeps and seq_len_q == 4)
     assert cfg.is_nvfp4_keeps_q128_block16 is (expected_keeps and seq_len_q == 8)
+    assert cfg.publishes_partial_fp8_p is (expected_keeps and seq_len_q == 4)
+    if cfg.publishes_partial_fp8_p:
+        assert cfg.uses_fragmented_tmem_p
+        assert cfg.num_tmem_p_fragments == 2
     assert cfg.use_keeps_mma_ab is expected_keeps
     assert cfg.store_transformed_kv_in_tmem is not expected_keeps
     if expected_keeps:
@@ -4338,6 +4344,8 @@ def test_attention_ts_decode_nvfp4_p64_keeps_launch(
         assert cfg.num_insts_kv == cfg.o_stages == 2
         # Four splits would otherwise be capped to the unsupported fanout three.
         expected_splits = 4 if batch_size <= 64 and max_kv_len > 1536 else 2
+        if seq_len_q == 4 and batch_size <= 64 and max_kv_len > 3072:
+            expected_splits = 7
         assert cfg.splits_kv == cfg.max_splits_kv == expected_splits
         assert cfg.kv_stages == 12
         assert cfg.transformed_kv_stages == 4

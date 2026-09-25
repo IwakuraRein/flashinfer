@@ -2146,6 +2146,23 @@ class FmhaDecodeConfig:
         )
 
     @property
+    def publishes_partial_fp8_p(self) -> bool:
+        """Publish fixed-Q4 FP8 probabilities in two independently ready parts."""
+        return self.is_nvfp4_keeps_q64_block16 and cutlass.target_version(
+            min_version="13.4"
+        )
+
+    @property
+    def uses_fragmented_tmem_p(self) -> bool:
+        """Whether P readiness is signaled by private fragment barriers."""
+        return self.streams_tmem_p_fragments or self.publishes_partial_fp8_p
+
+    @property
+    def num_tmem_p_fragments(self) -> int:
+        """Return readiness signals per P tile without changing S ownership."""
+        return 2 if self.publishes_partial_fp8_p else self.num_softmax_score_fragments
+
+    @property
     def streams_tmem_p_fragments(self) -> bool:
         """Whether P is published as independently ready TMEM fragments.
 
@@ -2418,7 +2435,7 @@ class FmhaDecodeConfig:
             and self.transform_kv_num_warps == 4
             and self.use_split_kv
             and self.splits_kv == self.max_splits_kv
-            and self.splits_kv in (2, 4)
+            and self.splits_kv in (2, 4, 7)
             and not self.store_transformed_kv_in_tmem
             and not self.use_variable_seqlens_q
             and self.mask_type == CAUSAL

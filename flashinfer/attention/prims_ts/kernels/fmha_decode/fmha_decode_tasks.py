@@ -403,7 +403,7 @@ def _consume_streamed_pv_fragments(
         p_tmem_addr=p_tmem_addr,
         fragment_idx=0,
     )
-    for fragment_idx in range(1, cfg.num_softmax_score_fragments):
+    for fragment_idx in range(1, cfg.num_tmem_p_fragments):
         p_tmem_addr = tmem_p.wait_p_fragment(fragment_idx=fragment_idx)
         getattr(tmem_o, fragment_label)(
             v_desc=v_desc,
@@ -426,7 +426,7 @@ def _consume_staged_pv_mma(
 ) -> None:
     """Consume all V head-dim stages for one PV MMA wave."""
     _ = section
-    if cutlass.const_expr(cfg.streams_tmem_p_fragments):
+    if cutlass.const_expr(cfg.uses_fragmented_tmem_p):
         _consume_streamed_pv_fragments(
             smem_kv, tmem_p, tmem_o, v_desc_label, vp_mma_label, cfg
         )
@@ -3152,7 +3152,15 @@ def create_softmax0_task(
                 sum_arr=sum_arr,
             )
             tmem_softmax_local0.commit()
-            if cutlass.const_expr(cfg.streams_tmem_p_fragments):
+            if cutlass.const_expr(cfg.publishes_partial_fp8_p):
+                # Keep the existing score/max/FP8 scaling path and ordered
+                # softmax baton; only the P-ready handoff becomes partial.
+                if tmem_softmax_order is not None:
+                    tmem_softmax_order.wait_softmax0()
+                smem_p0.compute_p(new_max_arr=new_max_arr, s_arr=s_arr)
+                if tmem_softmax_order is not None:
+                    tmem_softmax_order.release_softmax1()
+            elif cutlass.const_expr(cfg.streams_tmem_p_fragments):
                 # One rolled loop streams every K32 probability fragment; the
                 # fragment body exists once in the instruction stream.
                 if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
@@ -3396,7 +3404,15 @@ def create_softmax1_task(
                 sum_arr=sum_arr,
             )
             tmem_softmax_local1.commit()
-            if cutlass.const_expr(cfg.streams_tmem_p_fragments):
+            if cutlass.const_expr(cfg.publishes_partial_fp8_p):
+                # Keep the existing score/max/FP8 scaling path and ordered
+                # softmax baton; only the P-ready handoff becomes partial.
+                if tmem_softmax_order is not None:
+                    tmem_softmax_order.wait_softmax1()
+                smem_p1.compute_p(new_max_arr=new_max_arr, s_arr=s_arr)
+                if tmem_softmax_order is not None:
+                    tmem_softmax_order.release_softmax0()
+            elif cutlass.const_expr(cfg.streams_tmem_p_fragments):
                 if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
                     smem_p1.compute_proxy_route_p_fragments(
                         new_max_arr=new_max_arr,

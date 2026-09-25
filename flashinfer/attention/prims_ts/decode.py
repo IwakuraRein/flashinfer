@@ -1322,6 +1322,13 @@ def _resolve_decode_launch_spec(
                 and max_kv_len > 3 * 128 * 2 * MIN_LOOP_ITERS_PER_SPLIT
                 else 2
             )
+            # More Q4 splits improve utilization; retain the minimum work per split.
+            if (
+                seq_len_q == 4
+                and batch_size <= 64
+                and max_kv_len > 6 * 128 * 2 * MIN_LOOP_ITERS_PER_SPLIT
+            ):
+                splits_kv = max_splits_kv = 7
         return make_decode_config(
             headdim=head_dim,
             args=args,

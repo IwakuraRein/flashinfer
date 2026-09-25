@@ -167,16 +167,16 @@ class SmemPResource(DecodeGenResourceBase):
             Int32, self.cfg.smem_p_tile_bytes // 4
         )
         self._fragment_ready = _placeholder_smem_array(
-            Int64, self.cfg.num_softmax_score_fragments
+            Int64, self.cfg.num_tmem_p_fragments
         )
 
     def get_smem_requirements(self) -> list[SmemAllocation]:
         """Allocate P storage or the streamed fragment-ready barriers."""
-        if self.cfg.streams_tmem_p_fragments:
+        if self.cfg.uses_fragmented_tmem_p:
             if self._fragment_ready_alloc is None:
                 self._fragment_ready_alloc = SmemAllocation(
                     name=f"{self.name}_fragmentReady",
-                    size_bytes=self.cfg.num_softmax_score_fragments * 8,
+                    size_bytes=self.cfg.num_tmem_p_fragments * 8,
                     alignment=16,
                 )
             return [self._fragment_ready_alloc]
@@ -194,7 +194,7 @@ class SmemPResource(DecodeGenResourceBase):
     def _bind_fragment_ready(self, context: ResourceContext | None = None) -> None:
         """Bind the one-way streamed P-ready barriers from the SMEM context."""
         if cutlass.const_expr(
-            self.cfg.streams_tmem_p_fragments
+            self.cfg.uses_fragmented_tmem_p
             and context is not None
             and context.smem_base is not None
             and self._fragment_ready_alloc is not None
@@ -202,7 +202,7 @@ class SmemPResource(DecodeGenResourceBase):
             self._fragment_ready = cutlass.Array(
                 context.smem_base.data_ptr() + self._fragment_ready_alloc.offset,
                 dtype=Int64,
-                shape=(self.cfg.num_softmax_score_fragments,),
+                shape=(self.cfg.num_tmem_p_fragments,),
                 addrspace=3,
             )
 
@@ -212,7 +212,7 @@ class SmemPResource(DecodeGenResourceBase):
     ) -> ResourceVars:
         """Bind and initialize the streamed per-fragment ready barriers."""
         self._bind_fragment_ready(context)
-        if cutlass.const_expr(self.cfg.streams_tmem_p_fragments):
+        if cutlass.const_expr(self.cfg.uses_fragmented_tmem_p):
             tidx, _, _ = cute.arch.thread_idx()
             producer_warps = (
                 self.cfg.softmax0_num_warps
@@ -221,7 +221,7 @@ class SmemPResource(DecodeGenResourceBase):
             )
             if tidx == Int32(0):
                 for fragment_idx in cutlass.range_constexpr(
-                    self.cfg.num_softmax_score_fragments
+                    self.cfg.num_tmem_p_fragments
                 ):
                     prims.mbarrier_init(
                         self._fragment_ready.data_ptr() + fragment_idx,
@@ -601,11 +601,11 @@ class SmemPResource(DecodeGenResourceBase):
         col_base = _keeps_col_base(cfg, lane_idx, num_s_regs)
         p_tmem_stage_base = Int32(0)
         if cutlass.const_expr(cfg.uses_tmem_p):
-            p_tmem_stage_base = (
-                self._tmem_base_addr
-                + Int32(self._tmem_alloc.offset)
-                + stage_info.stage_idx * cfg.tmem_s_cols
-            )
+            p_tmem_stage_base = self._tmem_base_addr + Int32(self._tmem_alloc.offset)
+            if cutlass.const_expr(not cfg.publishes_partial_fp8_p):
+                p_tmem_stage_base += stage_info.stage_idx * cfg.tmem_s_cols
+            # The partial Q4 path has one physical S/P slot and private
+            # readiness barriers, so it has no P-pipeline stage index.
 
         new_max = new_max_arr[0]
         safe_new_max = new_max
@@ -692,8 +692,32 @@ class SmemPResource(DecodeGenResourceBase):
                         )
 
             if cutlass.const_expr(cfg.uses_two_inst_tmem_p):
-                # Retain the complete packed row and publish it once below.
-                pass
+                if cutlass.const_expr(
+                    cfg.publishes_partial_fp8_p and block_idx % 2 == 1
+                ):
+                    # All lanes have completed 32 more P values. Paired
+                    # half-warps publish K32 slices {0,2}, then {1,3}; the
+                    # half-row offset stays 16 packed columns. S is already
+                    # fully masked and retained in registers, so these stores
+                    # may safely overlap its old TMEM columns.
+                    fragment_idx: Constexpr[int] = block_idx // 2
+                    packed_offset: Constexpr[int] = fragment_idx * 8
+                    _keeps_tcgen05_st(
+                        cfg,
+                        prims.make_tmem_ptr(
+                            p_tmem_stage_base + Int32(packed_offset), Int32
+                        ),
+                        (packed_p.data_ptr() + packed_offset).load(
+                            count=8, alignment=4
+                        ),
+                        offset=cfg.num_packed_p_regs,
+                    )
+                    cute.arch.fence_view_async_tmem_store()
+                    prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+                    if lane_idx == Int32(0):
+                        prims.mbarrier_arrive(
+                            self._fragment_ready.data_ptr() + Int32(fragment_idx)
+                        )
             elif cutlass.const_expr(cfg.uses_tmem_p):
                 # Each register packs two 16-bit P values. The q64 TMEM store shape
                 # maps paired half-warps onto the low/high 32-column halves of
@@ -723,22 +747,23 @@ class SmemPResource(DecodeGenResourceBase):
             assert cfg.num_packed_p_regs in (16, 32, 64)
             regs_per_store = cfg.num_packed_p_regs if cfg.use_fp8_pv else 16
             assert cfg.num_packed_p_regs % regs_per_store == 0
-            for store_idx in cutlass.range_constexpr(
-                cfg.num_packed_p_regs // regs_per_store
-            ):
-                packed_offset = store_idx * regs_per_store
-                _keeps_tcgen05_st(
-                    cfg,
-                    prims.make_tmem_ptr(
-                        p_tmem_stage_base + Int32(packed_offset), Int32
-                    ),
-                    (packed_p.data_ptr() + packed_offset).load(
-                        count=regs_per_store, alignment=4
-                    ),
-                    # Separate the paired Softmax destinations by one packed
-                    # row (the half-row split for x16/x32 TMEM layouts).
-                    offset=cfg.num_packed_p_regs,
-                )
+            if cutlass.const_expr(not cfg.publishes_partial_fp8_p):
+                for store_idx in cutlass.range_constexpr(
+                    cfg.num_packed_p_regs // regs_per_store
+                ):
+                    packed_offset = store_idx * regs_per_store
+                    _keeps_tcgen05_st(
+                        cfg,
+                        prims.make_tmem_ptr(
+                            p_tmem_stage_base + Int32(packed_offset), Int32
+                        ),
+                        (packed_p.data_ptr() + packed_offset).load(
+                            count=regs_per_store, alignment=4
+                        ),
+                        # Separate the paired Softmax destinations by one packed
+                        # row (the half-row split for x16/x32 TMEM layouts).
+                        offset=cfg.num_packed_p_regs,
+                    )
             if cutlass.const_expr(cfg.ordered_softmax_early_release):
                 # Hand the baton over as soon as this group's TMEM store has
                 # issued: the partner's exp2/pack/TMEM store touch only its own
@@ -1482,14 +1507,16 @@ class SmemPResource(DecodeGenResourceBase):
         """Wait for and return the next streamed P-fragment TMEM address."""
         cfg = self.cfg
         _ = stage_info
-        assert cfg.streams_tmem_p_fragments
+        assert cfg.uses_fragmented_tmem_p
         _wait_for_mbarrier_phase(
             self._fragment_ready.data_ptr() + Int32(fragment_idx),
             self.tmem_s_ref.producer_state.phase,
         )
         prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
 
-        fragment_cols = cfg.softmax_score_fragment_regs // 2
+        fragment_cols = (
+            8 if cfg.publishes_partial_fp8_p else cfg.softmax_score_fragment_regs // 2
+        )
         p_tmem_addr = self._tmem_base_addr + Int32(
             self._tmem_alloc.offset + fragment_idx * fragment_cols
         )

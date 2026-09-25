@@ -1012,6 +1012,7 @@ def _make_mixed_precision_decode_case(
     output_dtype: torch.dtype,
     device: str | torch.device,
     seed: int,
+    mask_type: str = "dense",
 ) -> tuple[_DecodeCase, Optional[tuple[torch.Tensor, torch.Tensor]]]:
     """Build a nonzero mixed-Q/KV case and its independent reference."""
 
@@ -1117,7 +1118,7 @@ def _make_mixed_precision_decode_case(
             bmm2_scale=1.0,
             output_dtype=output_dtype,
             o_scale=1.0,
-            mask_type="dense",
+            mask_type=mask_type,
         )
     else:
         reference = _decode_reference(
@@ -1131,7 +1132,7 @@ def _make_mixed_precision_decode_case(
             q_scale=1.0,
             k_scale=1.0,
             v_scale=1.0,
-            mask_type="dense",
+            mask_type=mask_type,
         )
     reference = reference.to(output_dtype).float()
     return (
@@ -1146,7 +1147,7 @@ def _make_mixed_precision_decode_case(
             paged_kv_last_page_len=last_page_len,
             reference_real=reference,
             output_dtype=output_dtype,
-            mask_type="dense",
+            mask_type=mask_type,
             bmm1_scale=bmm1_scale,
             bmm2_scale=1.0,
             q_scale=1.0,
@@ -4235,6 +4236,179 @@ def test_attention_ts_decode_paged_mixed_matches_o_stages_to_kv_insts(head_dim):
     assert cfg.o_stages == 1
     assert cfg.transform_kv_warp_idx == 4
     assert cfg.transform_kv_num_warps == 4
+
+
+@pytest.mark.parametrize("seq_len_q", (1, 2, 4, 8))
+@pytest.mark.parametrize("native_conversion", (False, True))
+@pytest.mark.parametrize(
+    "overrides",
+    ({}, {"num_insts_kv": 1}, {"o_stages": 1}, {"transform_kv_warp_idx": 4}),
+)
+def test_attention_ts_decode_nvfp4_p64_grouping(
+    monkeypatch, seq_len_q, native_conversion, overrides
+):
+    monkeypatch.setattr(cutlass, "target_version", lambda **kwargs: native_conversion)
+    cfg = _make_auto_kv_tile_config(
+        monkeypatch,
+        seq_len_q=seq_len_q,
+        seq_len_kv=262144,
+        batch_size=32,
+        num_heads_q=32,
+        num_heads_kv=2,
+        q_dtype=Float8E4M3FN,
+        k_dtype=Float4E2M1FN,
+        v_dtype=Float4E2M1FN,
+        o_dtype=Float8E4M3FN,
+        num_tokens_per_page=64,
+        mask_type="causal",
+        args=overrides,
+    )
+    assert cfg.q_tokens_per_cta == (1 if seq_len_q == 1 else 2)
+    expected_insts = 2 if seq_len_q > 1 and not overrides else 1
+    assert cfg.num_insts_kv == cfg.o_stages == expected_insts
+    assert cfg.transform_kv_warp_idx == (16 if expected_insts == 2 else 4)
+    assert cfg.transform_kv_num_warps == 4
+    assert cfg.store_transformed_kv_in_tmem
+    assert cfg.tmem_total_cols <= 512
+    tuned_registers = native_conversion and seq_len_q in (2, 4) and expected_insts == 2
+    assert cfg.transform_kv_task_num_registers == (112 if tuned_registers else 184)
+    if expected_insts == 2:
+        assert cfg.softmax_task_num_registers == (112 if tuned_registers else 72)
+
+
+@pytest.mark.parametrize("seq_len_q", (1, 2, 4, 8))
+@pytest.mark.parametrize("native_conversion", (False, True))
+@pytest.mark.parametrize("split_kv", (False, True))
+@pytest.mark.parametrize("batch_size", (32, 64, 65, 127, 128, 129, 256))
+@pytest.mark.parametrize(
+    "max_kv_len", (257, 512, 513, 1024, 1025, 1536, 1537, 3072, 3073, 1048576)
+)
+def test_attention_ts_decode_nvfp4_p64_keeps_launch(
+    monkeypatch, seq_len_q, native_conversion, split_kv, batch_size, max_kv_len
+):
+    from contextlib import nullcontext
+
+    monkeypatch.setattr(cutlass, "target_version", lambda **kwargs: native_conversion)
+
+    class _B200Hardware:
+        def get_device_multiprocessor_count(self) -> int:
+            return 148
+
+    monkeypatch.setattr(fmha_decode_config.utils, "HardwareInfo", _B200Hardware)
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "get_max_active_clusters_for_cluster_size",
+        lambda cluster_size: 148 // cluster_size,
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda *_args: nullcontext())
+    _resolve_decode_launch_spec.cache_clear()
+    try:
+        cfg = _resolve_decode_launch_spec(
+            0,
+            batch_size,
+            32,
+            2,
+            128,
+            64,
+            max_kv_len,
+            seq_len_q,
+            "float8_e4m3fn",
+            "float4_e2m1fn",
+            "float4_e2m1fn",
+            "float8_e4m3fn",
+            "HND",
+            "causal",
+            False,
+            -1,
+            split_kv=split_kv,
+        ).config
+    finally:
+        _resolve_decode_launch_spec.cache_clear()
+
+    expected_keeps = (
+        seq_len_q in (4, 8) and native_conversion and split_kv and max_kv_len > 512
+    )
+    assert cfg.is_nvfp4_keeps_q64_block16 is (expected_keeps and seq_len_q == 4)
+    assert cfg.is_nvfp4_keeps_q128_block16 is (expected_keeps and seq_len_q == 8)
+    assert cfg.publishes_partial_fp8_p is (expected_keeps and seq_len_q == 4)
+    if cfg.publishes_partial_fp8_p:
+        assert cfg.uses_fragmented_tmem_p
+        assert cfg.num_tmem_p_fragments == 2
+    assert cfg.use_keeps_mma_ab is expected_keeps
+    assert cfg.store_transformed_kv_in_tmem is not expected_keeps
+    if expected_keeps:
+        assert cfg.q_tokens_per_cta == seq_len_q
+        assert cfg.tile_size_q == 16 * seq_len_q
+        assert cfg.q_dtype == cfg.out_dtype == Float8E4M3FN
+        assert cfg.use_nvfp4_kv
+        assert cfg.num_insts_kv == cfg.o_stages == 2
+        # Four splits would otherwise be capped to the unsupported fanout three.
+        expected_splits = 4 if batch_size <= 64 and max_kv_len > 1536 else 2
+        if seq_len_q == 4 and batch_size <= 64 and max_kv_len > 3072:
+            expected_splits = 7
+        assert cfg.splits_kv == cfg.max_splits_kv == expected_splits
+        assert cfg.kv_stages == 12
+        assert cfg.transformed_kv_stages == 4
+        assert cfg.uses_two_inst_tmem_p
+        assert cfg.tmem_p_cols_per_inst == 32
+        assert cfg.tmem_total_cols <= 512
+        expected_registers = (176, 40, 32, 56) if seq_len_q == 8 else (136, 88, 56, 56)
+        assert (
+            cfg.softmax_task_num_registers,
+            cfg.correction_task_num_registers,
+            cfg.mma_load_task_num_registers,
+            cfg.transform_kv_task_num_registers,
+        ) == expected_registers
+        assert cfg.uses_ordered_softmax_barrier is not (
+            seq_len_q == 8 and batch_size >= 128
+        )
+        assert not cfg.use_persistent_scheduler
+        assert not cfg.use_separate_reduction_kernel
+    if not split_kv:
+        assert not cfg.use_split_kv
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize("seq_len_q", (2, 4, 8))
+@pytest.mark.parametrize("seq_len_kv", (257, 4096))
+@pytest.mark.parametrize("batch_size", (32, 128))
+def test_attention_ts_decode_nvfp4_p64_causal(seq_len_q, seq_len_kv, batch_size):
+    case, scales = _make_mixed_precision_decode_case(
+        batch_size=batch_size,
+        seq_len_kv=seq_len_kv,
+        num_qo_heads=32,
+        num_kv_heads=2,
+        head_dim=128,
+        seq_len_q=seq_len_q,
+        page_size=64,
+        q_dtype=_FP8,
+        kv_dtype=torch.uint8,
+        output_dtype=_FP8,
+        device="cuda",
+        seed=20260924,
+        mask_type="causal",
+    )
+    wrapper = _plan_case(case, max_kv_len=seq_len_kv)
+
+    def run():
+        return wrapper.run(
+            case.q,
+            case.paged_kv_cache,
+            None,
+            case.block_tables,
+            kv_scale_factors=scales,
+            bmm1_scale=case.bmm1_scale,
+            bmm2_scale=case.bmm2_scale,
+            validate=False,
+        )
+
+    _assert_case_correct(run(), case)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = run()
+    graph.replay()
+    _assert_case_correct(output, case)
 
 
 @pytest.mark.parametrize("heads_q_per_kv", (33, 64, 65, 128))

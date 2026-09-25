@@ -24,6 +24,7 @@ from copy import deepcopy
 from dataclasses import dataclass, fields, replace
 from functools import wraps
 
+import cutlass
 import cutlass.utils as utils
 from cutlass import BFloat16, Float16, Float32, Float4E2M1FN, Float8E4M3FN
 
@@ -861,6 +862,13 @@ class FmhaDecodeConfig:
 
     @property
     def correction_task_num_registers(self) -> int | None:
+        # Q128 assigns softmax/correction/load/transform 176/40/32/56
+        # registers, filling the CTA's 640 x 96 initial register pool.
+        # Keep transform at 56 to avoid repeated KV conversion spills.
+        if self.is_nvfp4_keeps_q128_block16 and cutlass.target_version(
+            min_version="13.4"
+        ):
+            return 40
         if not self.uses_task_register_reallocation:
             return None
         if self.use_transform_kv:
@@ -869,6 +877,10 @@ class FmhaDecodeConfig:
 
     @property
     def mma_load_task_num_registers(self) -> int | None:
+        if self.is_nvfp4_keeps_q128_block16 and cutlass.target_version(
+            min_version="13.4"
+        ):
+            return 32
         if not self.uses_task_register_reallocation:
             return None
         if self.use_transform_kv and self.headdim == 64 and self.num_insts_kv != 1:
@@ -879,6 +891,21 @@ class FmhaDecodeConfig:
     def transform_kv_task_num_registers(self) -> int | None:
         if not self.use_transform_kv:
             return None
+        if (
+            self.store_transformed_kv_in_tmem
+            and self.num_insts_kv == 2
+            and self.use_nvfp4_kv
+            and self.use_fp8_q
+            and self.use_paged_kv
+            and self.num_tokens_per_page == 64
+            and self.headdim == 128
+            and self.heads_q_per_kv == 16
+            and self.max_seq_len_q in (2, 4)
+            and cutlass.target_version(min_version="13.4")
+        ):
+            # Native FP4 conversion needs fewer registers, leaving more of
+            # the CTA register pool for both softmax instances.
+            return 112
         if self.num_insts_kv == 1 or self.store_transformed_kv_in_tmem:
             return 184
         if self.headdim == 64:
@@ -1533,6 +1560,10 @@ class FmhaDecodeConfig:
         columns per instance.
         """
         if self.uses_two_inst_tmem_p:
+            if self.is_nvfp4_keeps_q64_block16:
+                # Q64 uses 16x32bx2: the two half-warps own separate packed
+                # rows, spaced by num_packed_p_regs in the TMEM columns.
+                return 2 * self.num_packed_p_regs
             return self.num_packed_p_regs
         return self.tmem_p_cols
 
@@ -2095,7 +2126,7 @@ class FmhaDecodeConfig:
         packed-P row per pipeline token. Q64/KV256 and block-sparse 16-bit
         Q128/KV128 use the same S-to-P aliasing contract but stream four
         independently ready K32 fragments (see ``streams_tmem_p_fragments``).
-        Q64/KV128 keeps the base kernel's faster SMEM-P cadence.
+        Q64/KV128 retains SMEM P except for the fixed-Q4 NVFP4 path.
         """
         # Two-instance Keeps keeps stats outside S, so both static and persistent
         # work tiles can overlay P on the consumed S instance. The split K/V
@@ -2106,12 +2137,30 @@ class FmhaDecodeConfig:
             and (
                 (self.tile_size_q == 128 and self.tile_size_kv == 128)
                 or (self.tile_size_q == 64 and self.tile_size_kv == 256)
+                or self.is_nvfp4_keeps_q64_block16
             )
             and self.head_dim_per_stage_kv == 0
             and self.num_insts_kv == 2
             and self.o_stages == 2
             and self.tmem_total_cols <= 512
         )
+
+    @property
+    def publishes_partial_fp8_p(self) -> bool:
+        """Publish fixed-Q4 FP8 probabilities in two independently ready parts."""
+        return self.is_nvfp4_keeps_q64_block16 and cutlass.target_version(
+            min_version="13.4"
+        )
+
+    @property
+    def uses_fragmented_tmem_p(self) -> bool:
+        """Whether P readiness is signaled by private fragment barriers."""
+        return self.streams_tmem_p_fragments or self.publishes_partial_fp8_p
+
+    @property
+    def num_tmem_p_fragments(self) -> int:
+        """Return readiness signals per P tile without changing S ownership."""
+        return 2 if self.publishes_partial_fp8_p else self.num_softmax_score_fragments
 
     @property
     def streams_tmem_p_fragments(self) -> bool:
@@ -2366,8 +2415,86 @@ class FmhaDecodeConfig:
             )
 
     @property
+    def is_nvfp4_keeps_q64_block16(self) -> bool:
+        """Recognize fixed-Q4 mixed-precision Keeps with block16 conversion."""
+        return (
+            self.use_keeps_mma_ab
+            and self.groups_tokens_heads_q
+            and self.use_paged_kv
+            and self.num_tokens_per_page == 64
+            and self.effective_storage_tokens_per_page == 64
+            and self.q_dtype == self.out_dtype == Float8E4M3FN
+            and self.use_nvfp4_kv
+            and self.headdim == 128
+            and self.head_dim_per_stage_kv == 0
+            and self.heads_q_per_kv == 16
+            and self.max_seq_len_q == 4
+            and self.tile_size_q == 64
+            and self.tile_size_kv == 128
+            and self.num_insts_kv == self.o_stages == 2
+            and self.transform_kv_num_warps == 4
+            and self.use_split_kv
+            and self.splits_kv == self.max_splits_kv
+            and self.splits_kv in (2, 4, 7)
+            and not self.store_transformed_kv_in_tmem
+            and not self.use_variable_seqlens_q
+            and self.mask_type == CAUSAL
+            and not any(
+                (
+                    self.use_persistent_scheduler,
+                    self.use_pdl,
+                    self.use_separate_reduction_kernel,
+                    self.use_cluster_smem_reduction,
+                    self.use_sliding_window_causal,
+                    self.use_attention_sinks,
+                    self.use_block_sparse,
+                )
+            )
+        )
+
+    @property
+    def is_nvfp4_keeps_q128_block16(self) -> bool:
+        """Recognize fixed-Q8 mixed-precision Keeps with block16 conversion."""
+        return (
+            self.use_keeps_mma_ab
+            and self.groups_tokens_heads_q
+            and self.use_paged_kv
+            and self.num_tokens_per_page == 64
+            and self.effective_storage_tokens_per_page == 64
+            and self.q_dtype == self.out_dtype == Float8E4M3FN
+            and self.use_nvfp4_kv
+            and self.headdim == 128
+            and self.head_dim_per_stage_kv == 0
+            and self.heads_q_per_kv == 16
+            and self.max_seq_len_q == 8
+            and self.tile_size_q == 128
+            and self.tile_size_kv == 128
+            and self.num_insts_kv == self.o_stages == 2
+            and self.transform_kv_num_warps == 4
+            and self.use_split_kv
+            and self.splits_kv == self.max_splits_kv
+            and self.splits_kv in (2, 4)
+            and not self.store_transformed_kv_in_tmem
+            and not self.use_variable_seqlens_q
+            and self.mask_type == CAUSAL
+            and not any(
+                (
+                    self.use_persistent_scheduler,
+                    self.use_pdl,
+                    self.use_separate_reduction_kernel,
+                    self.use_cluster_smem_reduction,
+                    self.use_sliding_window_causal,
+                    self.use_attention_sinks,
+                    self.use_block_sparse,
+                )
+            )
+        )
+
+    @property
     def supports_grouped_keeps(self) -> bool:
         """Whether a validated config uses a qualified grouped-Keeps recipe."""
+        if self.is_nvfp4_keeps_q64_block16 or self.is_nvfp4_keeps_q128_block16:
+            return True
         if self.tile_size_kv == 256:
             # KV256 reuses the common fixed/packed-Q, page-table, masking,
             # persistent scheduler, attention-sink, and GMEM split-publisher
@@ -2695,8 +2822,34 @@ def _finalize_static_decode_config(
         _set_if_implicit(cfg, "head_dim_per_stage_kv", 128, explicit_fields)
         _set_if_implicit(cfg, "num_insts_kv", 2, explicit_fields)
     if cfg.use_transform_kv and cfg.use_paged_kv:
-        # Force using 1 instances kv to allow more warps for transform kv tasks.
+        # Default to one KV instance so transform can reuse Softmax1's warps.
         _set_if_implicit(cfg, "num_insts_kv", 1, explicit_fields)
+        if (
+            cfg.use_nvfp4_kv
+            and cfg.use_fp8_q
+            and cfg.headdim == 128
+            and cfg.num_tokens_per_page == 64
+            and cfg.heads_q_per_kv == 16
+            and cfg.max_seq_len_q in (2, 4, 8)
+            and not cfg.use_variable_seqlens_q
+            and cfg.groups_tokens_heads_q
+            and cfg.mask_type == CAUSAL
+            and not cfg.use_sliding_window_causal
+            and not cfg.use_attention_sinks
+            and not explicit_fields.intersection(
+                {
+                    "num_insts_kv",
+                    "o_stages",
+                    "transform_kv_warp_idx",
+                    "transform_kv_num_warps",
+                }
+            )
+        ):
+            # Two softmax instances overlap alternating KV tiles. Keep a full
+            # transform warp group in WG4 instead of sharing Softmax1's WG.
+            _set_if_implicit(cfg, "num_insts_kv", 2, explicit_fields)
+            _set_if_implicit(cfg, "transform_kv_warp_idx", 16, explicit_fields)
+            _set_if_implicit(cfg, "transform_kv_num_warps", 4, explicit_fields)
 
     if use_keeps_mma_ab:
         tile_size_q = cfg.tile_size_q if "tile_size_q" in explicit_fields else 64
@@ -3776,7 +3929,17 @@ def _apply_auto_grouped_q_mma_config(
         or cfg.use_variable_seqlens_q
         or not cfg.groups_tokens_heads_q
         or not cfg.use_paged_kv
-        or cfg.num_tokens_per_page != 32
+        or not (
+            cfg.num_tokens_per_page == 32
+            or (
+                cfg.num_tokens_per_page == 64
+                and cfg.use_nvfp4_kv
+                and cfg.use_fp8_q
+                and cfg.headdim == 128
+                and num_heads_q // num_heads_kv == 16
+                and seq_len_q in (2, 4, 8)
+            )
+        )
         or cfg.mask_type != CAUSAL
         or cfg.use_sliding_window_causal
         or cfg.use_attention_sinks
@@ -4422,7 +4585,9 @@ def _validate_profile_support(
             "and a four-warp TransformKvTask"
         )
     if use_keeps_mma_ab:
-        if cfg.use_transform_kv:
+        if cfg.use_transform_kv and not (
+            cfg.is_nvfp4_keeps_q64_block16 or cfg.is_nvfp4_keeps_q128_block16
+        ):
             raise ValueError("transform-KV is not supported with KeepsMmaAb for now")
         if headdim not in (64, 128, 256):
             raise ValueError("fmha_decode keepsMmaAb supports headdim=64, 128, or 256")

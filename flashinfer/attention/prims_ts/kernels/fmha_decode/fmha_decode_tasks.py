@@ -403,7 +403,7 @@ def _consume_streamed_pv_fragments(
         p_tmem_addr=p_tmem_addr,
         fragment_idx=0,
     )
-    for fragment_idx in range(1, cfg.num_softmax_score_fragments):
+    for fragment_idx in range(1, cfg.num_tmem_p_fragments):
         p_tmem_addr = tmem_p.wait_p_fragment(fragment_idx=fragment_idx)
         getattr(tmem_o, fragment_label)(
             v_desc=v_desc,
@@ -426,7 +426,7 @@ def _consume_staged_pv_mma(
 ) -> None:
     """Consume all V head-dim stages for one PV MMA wave."""
     _ = section
-    if cutlass.const_expr(cfg.streams_tmem_p_fragments):
+    if cutlass.const_expr(cfg.uses_fragmented_tmem_p):
         _consume_streamed_pv_fragments(
             smem_kv, tmem_p, tmem_o, v_desc_label, vp_mma_label, cfg
         )
@@ -779,12 +779,11 @@ class DecodeGenTask(Task):
         context: ResourceContext | None = None,
     ) -> None:
         """Run one ordinary task tile and synchronize attention-sink tails."""
-        Task._run_task_body_impl(
-            self,
-            work_tile,
-            skip_work_tile,
-            context=context,
-        )
+        # CUTLASS 4.8 removes the context argument; 4.7 still passes it here.
+        if cutlass.const_expr(context is None):
+            Task._run_task_body_impl(self, work_tile, skip_work_tile)
+        else:
+            Task._run_task_body_impl(self, work_tile, skip_work_tile, context=context)
         if cutlass.const_expr(
             self.cfg is not None
             and self.cfg.use_persistent_scheduler
@@ -823,7 +822,10 @@ class DecodeGenTask(Task):
             and self._has_skip_if
         )
         if cutlass.const_expr(not use_packed_early_stop):
-            Task._run_task_body_persistent(self, context)
+            if cutlass.const_expr(context is None):
+                Task._run_task_body_persistent(self)
+            else:
+                Task._run_task_body_persistent(self, context)
             return
 
         assert self.work_queue is not None
@@ -853,7 +855,10 @@ class DecodeGenTask(Task):
             # The tile is known active here. Running the complete schedule
             # without a dynamic skip guard keeps HEAD-produced pipeline state
             # in scope for LOOP and TAIL.
-            Task._run_task_body_impl(self, work_tile, None, context=context)
+            if cutlass.const_expr(context is None):
+                Task._run_task_body_impl(self, work_tile, None)
+            else:
+                Task._run_task_body_impl(self, work_tile, None, context=context)
             if cutlass.const_expr(self.cfg.use_attention_sinks):
                 prims.barrier_cta_sync(12, thread_count=16 * 32)
             work_tile = self.work_queue._get_consumer_var_from_ts("work_tile")
@@ -2681,7 +2686,7 @@ def create_transform_kv_task(
     """Create the K/V transform task.
 
     Consume one shared ``smem_kv``, or the four split `smem_k0/k1/v0/v1`
-    and publish the same ordered K0/V0/K1/V1 stream into ``smem_transformed_kv``.
+    and publish the stream into ``smem_transformed_kv`` in MMA consumption order.
     """
     head_labels = (
         ("transform_k0",) if cfg.num_insts_kv == 1 else ("transform_k0", "transform_k1")
@@ -2691,6 +2696,12 @@ def create_transform_kv_task(
         if cfg.num_insts_kv == 1
         else ("transform_k0", "transform_v0", "transform_k1", "transform_v1")
     )
+    if (
+        cfg.is_nvfp4_keeps_q64_block16 or cfg.is_nvfp4_keeps_q128_block16
+    ) and cfg.uses_two_inst_tmem_p:
+        # The aliased P must be consumed before QK overwrites the same S
+        # region. Match create_mma_task's V-before-K transformed FIFO order.
+        loop_labels = ("transform_v0", "transform_k0", "transform_v1", "transform_k1")
     tail_labels = (
         ("transform_v0",) if cfg.num_insts_kv == 1 else ("transform_v0", "transform_v1")
     )
@@ -3141,7 +3152,15 @@ def create_softmax0_task(
                 sum_arr=sum_arr,
             )
             tmem_softmax_local0.commit()
-            if cutlass.const_expr(cfg.streams_tmem_p_fragments):
+            if cutlass.const_expr(cfg.publishes_partial_fp8_p):
+                # Keep the existing score/max/FP8 scaling path and ordered
+                # softmax baton; only the P-ready handoff becomes partial.
+                if tmem_softmax_order is not None:
+                    tmem_softmax_order.wait_softmax0()
+                smem_p0.compute_p(new_max_arr=new_max_arr, s_arr=s_arr)
+                if tmem_softmax_order is not None:
+                    tmem_softmax_order.release_softmax1()
+            elif cutlass.const_expr(cfg.streams_tmem_p_fragments):
                 # One rolled loop streams every K32 probability fragment; the
                 # fragment body exists once in the instruction stream.
                 if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
@@ -3385,7 +3404,15 @@ def create_softmax1_task(
                 sum_arr=sum_arr,
             )
             tmem_softmax_local1.commit()
-            if cutlass.const_expr(cfg.streams_tmem_p_fragments):
+            if cutlass.const_expr(cfg.publishes_partial_fp8_p):
+                # Keep the existing score/max/FP8 scaling path and ordered
+                # softmax baton; only the P-ready handoff becomes partial.
+                if tmem_softmax_order is not None:
+                    tmem_softmax_order.wait_softmax1()
+                smem_p1.compute_p(new_max_arr=new_max_arr, s_arr=s_arr)
+                if tmem_softmax_order is not None:
+                    tmem_softmax_order.release_softmax0()
+            elif cutlass.const_expr(cfg.streams_tmem_p_fragments):
                 if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
                     smem_p1.compute_proxy_route_p_fragments(
                         new_max_arr=new_max_arr,

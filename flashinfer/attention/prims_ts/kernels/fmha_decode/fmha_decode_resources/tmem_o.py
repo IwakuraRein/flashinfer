@@ -245,7 +245,7 @@ class TmemOResource(DecodeGenResourceBase):
         the plain M=128 instruction and advances V by one K16 slice per step.
         """
         cfg = self.cfg
-        assert cfg.streams_tmem_p_fragments
+        assert cfg.uses_fragmented_tmem_p
         v_desc = _freeze_smem_descriptor(v_desc)
 
         task_cache = _decode_gen_task_cache(stage_info)
@@ -266,30 +266,20 @@ class TmemOResource(DecodeGenResourceBase):
             n_dim=mma_n,
             m_dim=mma_m,
         )
-        first_k_step = fragment_idx * 2
-        if prims.elect_sync():
-            for local_k_step in cutlass.range_constexpr(2):
-                k_step = first_k_step + local_k_step
-                p_operand = prims.make_tmem_ptr(
-                    p_tmem_addr + Int32(local_k_step * 8), Int32
-                )
-                scale_d = initial_scale_d or fragment_idx != 0 or local_k_step != 0
-                if cutlass.const_expr(cfg.uses_ws_2x2_datapath):
-                    # V holds four K64 atoms; jump between atoms every four
-                    # K16 steps.
-                    iter_v_desc = v_desc + Int32(
-                        (k_step // 4) * cfg.headdim * 16 + (k_step % 4) * 128
+        if cutlass.const_expr(cfg.publishes_partial_fp8_p):
+            # Q64 lanes publish paired K32 slices: 0/2 before 1/3. P's
+            # paired half-row is 16 packed columns apart; V advances by the
+            # same K32 stride as the unchanged complete-row FP8 MMA path.
+            assert cfg.tile_size_q == 64 and cfg.tile_size_kv == 128
+            assert cfg.use_fp8_pv and cfg.num_tmem_p_fragments == 2
+            if prims.elect_sync():
+                for local_k_step in cutlass.range_constexpr(2):
+                    k_step = fragment_idx + 2 * local_k_step
+                    p_operand = prims.make_tmem_ptr(
+                        p_tmem_addr + Int32(local_k_step * 16), Int32
                     )
-                    tcgen05_mma_ws(
-                        _mma_kind_for_pv(cfg),
-                        tmem_col,
-                        p_operand,
-                        iter_v_desc,
-                        idesc,
-                        scale_d,
-                    )
-                else:
-                    iter_v_desc = v_desc + Int32(k_step * 128)
+                    iter_v_desc = v_desc + Int32(k_step * cfg.headdim * 2)
+                    scale_d = initial_scale_d or fragment_idx != 0 or local_k_step != 0
                     prims.tcgen05_mma(
                         _mma_kind_for_pv(cfg),
                         prims.CTAGroup.CTA_1,
@@ -299,6 +289,40 @@ class TmemOResource(DecodeGenResourceBase):
                         idesc,
                         scale_d,
                     )
+        else:
+            first_k_step = fragment_idx * 2
+            if prims.elect_sync():
+                for local_k_step in cutlass.range_constexpr(2):
+                    k_step = first_k_step + local_k_step
+                    p_operand = prims.make_tmem_ptr(
+                        p_tmem_addr + Int32(local_k_step * 8), Int32
+                    )
+                    scale_d = initial_scale_d or fragment_idx != 0 or local_k_step != 0
+                    if cutlass.const_expr(cfg.uses_ws_2x2_datapath):
+                        # V holds four K64 atoms; jump between atoms every four
+                        # K16 steps.
+                        iter_v_desc = v_desc + Int32(
+                            (k_step // 4) * cfg.headdim * 16 + (k_step % 4) * 128
+                        )
+                        tcgen05_mma_ws(
+                            _mma_kind_for_pv(cfg),
+                            tmem_col,
+                            p_operand,
+                            iter_v_desc,
+                            idesc,
+                            scale_d,
+                        )
+                    else:
+                        iter_v_desc = v_desc + Int32(k_step * 128)
+                        prims.tcgen05_mma(
+                            _mma_kind_for_pv(cfg),
+                            prims.CTAGroup.CTA_1,
+                            tmem_col,
+                            p_operand,
+                            iter_v_desc,
+                            idesc,
+                            scale_d,
+                        )
 
     @cute.jit
     def _vp_mma(

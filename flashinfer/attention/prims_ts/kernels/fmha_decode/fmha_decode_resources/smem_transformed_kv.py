@@ -418,6 +418,101 @@ class SmemTransformedKvResource(DecodeGenResourceBase):
                 )
 
     @cute.jit
+    def _transform_load_nvfp4_block16(
+        self,
+        is_v: int,
+        block_idx: Int32,
+        src_word_base: cutlass.Array,
+        src_sf_base: cutlass.Array,
+        dst_word_base: cutlass.Array,
+    ) -> None:
+        """Convert one H128 scale block with one scale and aligned vector I/O."""
+        # Eight scale blocks per token; V interleaves each group of four tokens.
+        sf_idx = block_idx
+        if cutlass.const_expr(is_v):
+            sf_idx = (
+                (block_idx & Int32(-32))
+                | ((block_idx & Int32(7)) << Int32(2))
+                | ((block_idx >> Int32(3)) & Int32(3))
+            )
+        sf_quad = Int32(src_sf_base[sf_idx]) * Int32(0x01010101)
+        # A 16-byte block stays contiguous under the 128-byte row swizzle.
+        dst_word_idx = (block_idx ^ ((block_idx >> Int32(3)) & Int32(7))) << Int32(2)
+        prims.inline_ptx_hl(
+            """
+            {
+                .reg .b32 a, b, o0, o1, o2, o3;
+                .reg .b16 a0, a1, b0, b1;
+                ld.shared.v2.b32 {a, b}, [{$r0}];
+                mov.b32 {a0, a1}, a;
+                mov.b32 {b0, b1}, b;
+                mul.e4m3x4.e2m1x4.e4m3x4.satfinite o0, a0, {$r2};
+                mul.e4m3x4.e2m1x4.e4m3x4.satfinite o1, a1, {$r2};
+                mul.e4m3x4.e2m1x4.e4m3x4.satfinite o2, b0, {$r2};
+                mul.e4m3x4.e2m1x4.e4m3x4.satfinite o3, b1, {$r2};
+                st.shared.v4.b32 [{$r1}], {o0, o1, o2, o3};
+            }
+            """,
+            read_only_args=[
+                src_word_base.subview(block_idx << Int32(1)).data_ptr(),
+                dst_word_base.subview(dst_word_idx).data_ptr(),
+                sf_quad,
+            ],
+        )
+
+    @cute.jit
+    def _transform_load_nvfp4_block16_pair(
+        self,
+        is_v: int,
+        block_idx: Int32,
+        src_word_base: cutlass.Array,
+        src_sf_base: cutlass.Array,
+        dst_word_base: cutlass.Array,
+    ) -> None:
+        """Convert two Q4 scale blocks separated by 128 block indices."""
+        sf_idx = block_idx
+        if cutlass.const_expr(is_v):
+            sf_idx = (
+                (block_idx & Int32(-32))
+                | ((block_idx & Int32(7)) << Int32(2))
+                | ((block_idx >> Int32(3)) & Int32(3))
+            )
+        # The second block preserves all low swizzle/interleave bits.
+        sf_quad0 = Int32(src_sf_base[sf_idx]) * Int32(0x01010101)
+        sf_quad1 = Int32(src_sf_base[sf_idx + Int32(128)]) * Int32(0x01010101)
+        dst_word_idx = (block_idx ^ ((block_idx >> Int32(3)) & Int32(7))) << Int32(2)
+        prims.inline_ptx_hl(
+            """
+            {
+                .reg .b32 a, b, c, d, o0, o1, o2, o3, o4, o5, o6, o7;
+                .reg .b16 a0, a1, b0, b1, c0, c1, d0, d1;
+                ld.shared.v2.b32 {a, b}, [{$r0}];
+                ld.shared.v2.b32 {c, d}, [{$r0}+1024];
+                mov.b32 {a0, a1}, a;
+                mov.b32 {b0, b1}, b;
+                mov.b32 {c0, c1}, c;
+                mov.b32 {d0, d1}, d;
+                mul.e4m3x4.e2m1x4.e4m3x4.satfinite o0, a0, {$r2};
+                mul.e4m3x4.e2m1x4.e4m3x4.satfinite o1, a1, {$r2};
+                mul.e4m3x4.e2m1x4.e4m3x4.satfinite o2, b0, {$r2};
+                mul.e4m3x4.e2m1x4.e4m3x4.satfinite o3, b1, {$r2};
+                mul.e4m3x4.e2m1x4.e4m3x4.satfinite o4, c0, {$r3};
+                mul.e4m3x4.e2m1x4.e4m3x4.satfinite o5, c1, {$r3};
+                mul.e4m3x4.e2m1x4.e4m3x4.satfinite o6, d0, {$r3};
+                mul.e4m3x4.e2m1x4.e4m3x4.satfinite o7, d1, {$r3};
+                st.shared.v4.b32 [{$r1}], {o0, o1, o2, o3};
+                st.shared.v4.b32 [{$r1}+2048], {o4, o5, o6, o7};
+            }
+            """,
+            read_only_args=[
+                src_word_base.subview(block_idx << Int32(1)).data_ptr(),
+                dst_word_base.subview(dst_word_idx).data_ptr(),
+                sf_quad0,
+                sf_quad1,
+            ],
+        )
+
+    @cute.jit
     def _transform_load(
         self,
         stage_info: StageInfo,
@@ -471,31 +566,48 @@ class SmemTransformedKvResource(DecodeGenResourceBase):
             src_sf_base = src._sf_stage_base(src_stage_idx)
         total_elems = cfg.tile_size_kv * cfg.head_dim_kv_stage
         num_threads = cfg.transform_kv_num_warps * 32
-        chunks_per_thread = total_elems // (num_threads * 8)
-        for e in cutlass.range(chunks_per_thread, unroll=8):
-            chunk_idx = Int32(e * num_threads) + transform_thread_idx
-            elem_idx = chunk_idx * Int32(8)
-            if cutlass.const_expr(cfg.use_nvfp4_kv):
-                self._transform_load_nvfp4_chunk(
-                    stage_info,
-                    head_dim_stage_idx,
-                    inst_id,
-                    is_v,
-                    chunk_idx,
-                    elem_idx,
-                    src_word_base,
-                    src_sf_base,
-                    dst_word_base,
-                    dst_pair_base,
-                )
+        if cutlass.const_expr(
+            (cfg.is_nvfp4_keeps_q64_block16 or cfg.is_nvfp4_keeps_q128_block16)
+            and cutlass.target_version(min_version="13.4")
+        ):
+            if cutlass.const_expr(cfg.is_nvfp4_keeps_q64_block16):
+                # Two LDS64 operations can overlap before their native converts.
+                for e in cutlass.range(total_elems // (num_threads * 32), unroll=4):
+                    block_idx = Int32(e * num_threads * 2) + transform_thread_idx
+                    self._transform_load_nvfp4_block16_pair(
+                        is_v, block_idx, src_word_base, src_sf_base, dst_word_base
+                    )
             else:
-                self._transform_load_fp8_chunk(
-                    chunk_idx,
-                    elem_idx,
-                    src_word_base,
-                    dst_pair_base,
-                )
-
+                for e in cutlass.range(total_elems // (num_threads * 16), unroll=8):
+                    block_idx = Int32(e * num_threads) + transform_thread_idx
+                    self._transform_load_nvfp4_block16(
+                        is_v, block_idx, src_word_base, src_sf_base, dst_word_base
+                    )
+        else:
+            chunks_per_thread = total_elems // (num_threads * 8)
+            for e in cutlass.range(chunks_per_thread, unroll=8):
+                chunk_idx = Int32(e * num_threads) + transform_thread_idx
+                elem_idx = chunk_idx * Int32(8)
+                if cutlass.const_expr(cfg.use_nvfp4_kv):
+                    self._transform_load_nvfp4_chunk(
+                        stage_info,
+                        head_dim_stage_idx,
+                        inst_id,
+                        is_v,
+                        chunk_idx,
+                        elem_idx,
+                        src_word_base,
+                        src_sf_base,
+                        dst_word_base,
+                        dst_pair_base,
+                    )
+                else:
+                    self._transform_load_fp8_chunk(
+                        chunk_idx,
+                        elem_idx,
+                        src_word_base,
+                        dst_pair_base,
+                    )
         cute.arch.fence_view_async_shared()
 
     @producer_work
